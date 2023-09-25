@@ -1,0 +1,10 @@
+name = "HeapSnapshotUtils"
+uuid = "92ed2492-71ab-4afd-8ae5-bd60289b9828"
+authors = ["Tomáš Drvoštěp <tomas.drvostep@gmail.com>"]
+version = "0.1.0"
+
+[deps]
+CodecZlibNG = "642d12eb-acb5-4437-bcfc-a25e07ad685c"
+JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
+Mmap = "a63ad114-7e13-5084-954f-fe012c677804"
+Parsers = "69de0a69-1ddd-5017-9359-2bf0b02dc9f0"
