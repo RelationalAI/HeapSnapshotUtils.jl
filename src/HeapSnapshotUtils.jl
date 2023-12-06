@@ -102,7 +102,7 @@ function _parse_edges_array!(nodes, file, pos, backwards_edges, options)
             pos += res3.tlen
             pos = last(something(findnext(_parseable, file, pos), pos:pos))
 
-            idx = div(to_node + true, n_node_fields) # convert an index in the nodes array to a node number
+            idx = div(to_node, n_node_fields) + true # convert an index in the nodes array to a node number
 
             push!(backwards_edges[idx], node_idx)
             index += 1
@@ -143,7 +143,7 @@ function _parse_and_assebmle_edges_array!(nodes, file, pos, edge_count, options)
         edges.type[index] = edge_type
         edges.name_index[index] = edge_name_index
         edges.to_pos[index] = to_node + true
-        nodes.edge_count[from_node] += 1
+        nodes.edge_count[from_node+1] += 1
     end
     return pos
 end
@@ -302,14 +302,14 @@ function filter_nodes!(nodes, backwards_edges, always_keep_types, always_keep_si
     return nodes
 end
 
-function filter_strings(filtered_nodes, strings, edge_types_map)
+function filter_strings(filtered_nodes, strings, edge_types_map, trunc_strings_to)
     strmap = Dict{String,Int}()
     new_strings = String[]
     property = edge_types_map["property"]
     for (i, str) in enumerate(filtered_nodes.name_index)
         let s = strings[str+1]
             filtered_nodes.name_index[i] = get!(strmap, s) do
-                push!(new_strings, s)
+                push!(new_strings, first(s, trunc_strings_to))
                 length(new_strings) - 1
             end
         end
@@ -320,7 +320,7 @@ function filter_strings(filtered_nodes, strings, edge_types_map)
         # name in the parent struct.
         if type == property
             let s = strings[edges.name_index[e]+1]
-                edges.name_index[e] = get!(strmap, s) do
+                edges.name_index[e] = get!(strmap, first(s, trunc_strings_to)) do
                     push!(new_strings, s)
                     length(new_strings) - 1
                 end
@@ -404,7 +404,7 @@ _default_outpath(in_path) = joinpath(dirname(in_path), string("subsampled_", bas
 
 The subsampled snapshot will contain all nodes reachable from the nodes that are kept.
 """
-function subsample_snapshot(in_path, out_path=_default_outpath(in_path), always_keep_types=(0,), always_keep_size=1024*1024, sample_prob=0.1)
+function subsample_snapshot(in_path, out_path=_default_outpath(in_path), always_keep_types=(0,), always_keep_size=1024*1024, sample_prob=0.1, trunc_strings_to=512*1024)
     @info "Reading snapshot from $(repr(in_path))"
     nodes, strings, backwards_edges = parse_nodes(in_path)
 
@@ -420,56 +420,56 @@ function subsample_snapshot(in_path, out_path=_default_outpath(in_path), always_
 
     print_sizes(nodes, strings, node_types)
 
-    new_strings = filter_strings(nodes, strings, edge_types_map)
+    new_strings = filter_strings(nodes, strings, edge_types_map, trunc_strings_to)
 
-    @info "Writing snapshot to   $(repr(out_path))"
+    @info "Writing snapshot to $(repr(out_path))"
     write_snapshot(out_path, nodes, node_fields, new_strings)
     return nothing
 end
 
-# TODO: implement compression
-function _default_assembled_outpath(in_prefix, compress)
-    gz_ext = compress ? ".gz" : ""
-    ext = endswith(in_prefix, ".heapsnapshot") ? gz_ext : ".heapsnapshot$gz_ext"
-    isempty(ext) ? in_prefix : string(in_prefix, ext)
-end
+# # TODO: Rework this to match https://github.com/JuliaLang/julia/pull/51518
+# function _default_assembled_outpath(in_prefix, compress)
+#     gz_ext = compress ? ".gz" : ""
+#     ext = endswith(in_prefix, ".heapsnapshot") ? gz_ext : ".heapsnapshot$gz_ext"
+#     isempty(ext) ? in_prefix : string(in_prefix, ext)
+# end
 
 
-"""
-    assemble_snapshot(in_prefix, out_path=in_prefix)
+# """
+#     assemble_snapshot(in_prefix, out_path=in_prefix)
 
-`in_prefix` is the shared common prefix of inputs, e.g. for:
-    - "./streaming_snapshot/2023-09-20T23_40_25.462.edges"
-    - "./streaming_snapshot/2023-09-20T23_40_25.462.nodes"
-    - "./streaming_snapshot/2023-09-20T23_40_25.462.strings"
-    - "./streaming_snapshot/2023-09-20T23_40_25.462.json"
-  the `in_prefix` should be "./streaming_snapshot/2023-09-20T23_40_25.462"
-`out_path`: where to write the assembled snapshot.
-     Chrome will complain the file extension is not ".heapsnapshot"
-"""
-function assemble_snapshot(in_prefix, out_path=nothing, compress=false)
-    if isnothing(out_path)
-        out_path = _default_assembled_outpath(in_prefix, compress)
-    end
-    @info "Reading snapshot from \"$in_prefix{.json,.nodes,.edges,.strings}\""
-    preamble = JSON3.read(string(in_prefix, ".json"))
-    node_count = preamble.snapshot.node_count
-    edge_count = preamble.snapshot.edge_count
-    node_fields = collect(preamble.snapshot.meta.node_fields)
+# `in_prefix` is the shared common prefix of inputs, e.g. for:
+#     - "./streaming_snapshot/2023-09-20T23_40_25.462.edges"
+#     - "./streaming_snapshot/2023-09-20T23_40_25.462.nodes"
+#     - "./streaming_snapshot/2023-09-20T23_40_25.462.strings"
+#     - "./streaming_snapshot/2023-09-20T23_40_25.462.json"
+#   the `in_prefix` should be "./streaming_snapshot/2023-09-20T23_40_25.462"
+# `out_path`: where to write the assembled snapshot.
+#      Chrome will complain the file extension is not ".heapsnapshot"
+# """
+# function assemble_snapshot(in_prefix, out_path=nothing, compress=false)
+#     if isnothing(out_path)
+#         out_path = _default_assembled_outpath(in_prefix, compress)
+#     end
+#     @info "Reading snapshot from \"$in_prefix{.json,.nodes,.edges,.strings}\""
+#     preamble = JSON3.read(string(in_prefix, ".json"))
+#     node_count = preamble.snapshot.node_count
+#     edge_count = preamble.snapshot.edge_count
+#     node_fields = collect(preamble.snapshot.meta.node_fields)
 
-    nodes = init_nodes(node_count, edge_count)
-    OPTIONS = Parsers.Options(delim=',', stripwhitespace=true, ignoreemptylines=true)
+#     nodes = init_nodes(node_count, edge_count)
+#     OPTIONS = Parsers.Options(delim=',', stripwhitespace=true, ignoreemptylines=true)
 
-    node_file = Mmap.mmap(string(in_prefix, ".nodes"); grow=false, shared=false)
-    _parse_nodes_array!(nodes, node_file, 1, OPTIONS)
+#     node_file = Mmap.mmap(string(in_prefix, ".nodes"); grow=false, shared=false)
+#     _parse_nodes_array!(nodes, node_file, 1, OPTIONS)
 
-    edges_file = Mmap.mmap(string(in_prefix, ".edges"); grow=false, shared=false)
-    _parse_and_assebmle_edges_array!(nodes, edges_file, 1, edge_count, OPTIONS)
+#     edges_file = Mmap.mmap(string(in_prefix, ".edges"); grow=false, shared=false)
+#     _parse_and_assebmle_edges_array!(nodes, edges_file, 1, edge_count, OPTIONS)
 
-    strings = JSON3.read(string(in_prefix, ".strings")).strings;
+#     strings = JSON3.read(string(in_prefix, ".strings")).strings;
 
-    @info "Writing snapshot to   $(repr(out_path))"
-    write_snapshot(out_path, nodes, node_fields, strings)
-end
+#     @info "Writing snapshot to   $(repr(out_path))"
+#     write_snapshot(out_path, nodes, node_fields, strings)
+# end
 
 end # module HeapSnapshotUtils
