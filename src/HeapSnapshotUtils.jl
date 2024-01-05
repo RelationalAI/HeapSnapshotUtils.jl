@@ -214,90 +214,94 @@ function Base.get!(f::Function, n::NodeBitset, x::UInt32)
     end
 end
 
-function _mark_seen_and_enqueue_ancestors!(seen, queue, node_idx, backwards_edges)
+function _mark!(seen, queue, node_idx, backwards_edges, mark_ancestors=false)
     get!(seen, node_idx) do
-        for parent_node_idx in backwards_edges[node_idx]
-            get!(seen, parent_node_idx) do
-                push!(queue, parent_node_idx)
+        if mark_ancestors
+            for parent_node_idx in backwards_edges[node_idx]
+                get!(seen, parent_node_idx) do
+                    push!(queue, parent_node_idx)
+                end
             end
         end
         return nothing
     end
 end
 
-function filter_nodes!(nodes, backwards_edges, always_keep_types, always_keep_size, sample_prob)
-    seen = NodeBitset(length(nodes))
+function filter_nodes!(f, nodes, strings, backwards_edges, mark_ancestors=false)
+    to_filter_out = NodeBitset(length(nodes))
     node_idxs = UInt32(1):UInt32(length(nodes))
 
     queue = UInt32[]
     for node_idx in node_idxs
-        type = nodes.type[node_idx]
+        node_type = nodes.type[node_idx]
         self_size = nodes.self_size[node_idx]
-        if !((type in always_keep_types) || (self_size >= always_keep_size) || (rand() < sample_prob))
-            continue
-        end
-        _mark_seen_and_enqueue_ancestors!(seen, queue, node_idx, backwards_edges)
+        node_name = strings[nodes.name_index[node_idx]+1]
+        f(node_type, self_size, node_name) && continue
+
+        _mark!(to_filter_out, queue, node_idx, backwards_edges, mark_ancestors)
 
         while !isempty(queue)
             node_idx = pop!(queue)
-            _mark_seen_and_enqueue_ancestors!(seen, queue, node_idx, backwards_edges)
+            _mark!(to_filter_out, queue, node_idx, backwards_edges, mark_ancestors)
         end
     end
 
     # Create an array that maps the old node index to the new node index
     new_pos = zeros(UInt32, length(nodes))
-    j = UInt32(0)
-    for i in node_idxs
-        if i in seen
-            j += UInt32(1)
-            new_pos[i] = j
+    new_node_idx = UInt32(0)
+    for node_idx in node_idxs
+        if !(node_idx in to_filter_out)
+            new_node_idx += UInt32(1)
+            new_pos[node_idx] = new_node_idx
         end
     end
 
     # Update the edges array
-    i = 0
-    j = 0
+    new_edge_idx = 0
+    edge_idx = 0
     edges = nodes.edges
     for node_idx in node_idxs
         edge_count = nodes.edge_count[node_idx]
-        if node_idx in seen
+        if node_idx in to_filter_out
+            # skip over all the edges of the node we're filtering out
+            edge_idx += edge_count
+        else
+            # filter out the edges to the nodes we're filtering out
             for _ in 1:edge_count
-                j += 1
-                to_pos = edges.to_pos[j]
-                if to_pos in seen
-                    i += 1
-                    edges.type[i] = edges.type[j]
-                    edges.name_index[i] = edges.name_index[j]
-                    edges.to_pos[i] = new_pos[to_pos]
-                else
+                edge_idx += 1
+                to_pos = edges.to_pos[edge_idx]
+                if to_pos in to_filter_out
                     nodes.edge_count[node_idx] -= 1
+                else
+                    new_edge_idx += 1
+                    edges.type[new_edge_idx] = edges.type[edge_idx]
+                    edges.name_index[new_edge_idx] = edges.name_index[edge_idx]
+                    edges.to_pos[new_edge_idx] = new_pos[to_pos]
                 end
             end
-        else
-            j += edge_count
         end
     end
-    resize!(edges.type, i)
-    resize!(edges.name_index, i)
-    resize!(edges.to_pos, i)
+    resize!(edges.type, new_edge_idx)
+    resize!(edges.name_index, new_edge_idx)
+    resize!(edges.to_pos, new_edge_idx)
 
     # Update the nodes array
-    j = 0
-    for i in node_idxs
-        if (i in seen)
-            j += 1
-            nodes.type[j] = nodes.type[i]
-            nodes.name_index[j] = nodes.name_index[i]
-            nodes.id[j] = nodes.id[i]
-            nodes.self_size[j] = nodes.self_size[i]
-            nodes.edge_count[j] = nodes.edge_count[i]
+    new_node_idx = 0
+    for node_idx in node_idxs
+        if !(node_idx in to_filter_out)
+            new_node_idx += 1
+            nodes.type[new_node_idx] = nodes.type[node_idx]
+            nodes.name_index[new_node_idx] = nodes.name_index[node_idx]
+            nodes.id[new_node_idx] = nodes.id[node_idx]
+            nodes.self_size[new_node_idx] = nodes.self_size[node_idx]
+            nodes.edge_count[new_node_idx] = nodes.edge_count[node_idx]
         end
     end
-    resize!(nodes.type, j)
-    resize!(nodes.name_index, j)
-    resize!(nodes.id, j)
-    resize!(nodes.self_size, j)
-    resize!(nodes.edge_count, j)
+    resize!(nodes.type, new_node_idx)
+    resize!(nodes.name_index, new_node_idx)
+    resize!(nodes.id, new_node_idx)
+    resize!(nodes.self_size, new_node_idx)
+    resize!(nodes.edge_count, new_node_idx)
 
     return nodes
 end
@@ -309,7 +313,7 @@ function filter_strings(filtered_nodes, strings, edge_types_map, trunc_strings_t
     for (i, str) in enumerate(filtered_nodes.name_index)
         let s = strings[str+1]
             filtered_nodes.name_index[i] = get!(strmap, s) do
-                push!(new_strings, first(s, trunc_strings_to))
+                push!(new_strings, isnothing(trunc_strings_to) ? s : first(s, trunc_strings_to))
                 length(new_strings) - 1
             end
         end
@@ -320,7 +324,7 @@ function filter_strings(filtered_nodes, strings, edge_types_map, trunc_strings_t
         # name in the parent struct.
         if type == property
             let s = strings[edges.name_index[e]+1]
-                edges.name_index[e] = get!(strmap, first(s, trunc_strings_to)) do
+                edges.name_index[e] = get!(strmap, isnothing(trunc_strings_to) ? s : first(s, trunc_strings_to)) do
                     push!(new_strings, s)
                     length(new_strings) - 1
                 end
@@ -394,17 +398,27 @@ end
 _default_outpath(in_path) = joinpath(dirname(in_path), string("subsampled_", basename(in_path)))
 
 """
-    subsample_snapshot(in_path, out_path, always_keep_types=(0,), always_keep_size=1024*1024, sample_prob=0.1)
+    subsample_snapshot(f, in_path, out_path; trunc_strings_to=nothing, mark_ancestors=false))
+- `f`: A function used for filtering nodes. It should take the following arguments:
+    - `node_type`: index into `snapshot.meta.node_types`
+    - `node_size`: size of the object itself in bytes
+    - `node_name`: name of the object
+- `in_path`: path to the snapshot to subsample
+- `out_path`: where to write the subsampled snapshot
+- `trunc_strings_to`: if not `nothing`, strings will be truncated to this length
+- `mark_ancestors`: if `true`, all ancestors of filtered nodes will also be filtered out
 
-`in_path`: path to the snapshot to subsample
-`out_path`: where to write the subsampled snapshot
-`always_keep_types`: node types to always keep (indices to `snapshot.meta.node_types`)
-`always_keep_size`: nodes with `self_size` >= `always_keep_size` will always be kept
-`sample_prob`: probability of keeping a node with `self_size` < `always_keep_size`
+Example:
+```julia
+subsample_snapshot("profile1.heapsnapshot") do node_type, node_size, node_name
+    # node types are 0 based indices into: ["synthetic","jl_task_t","jl_module_t","jl_array_t","object","String","jl_datatype_t","jl_svec_t","jl_sym_t"]
+    node_type in (0,1,2,6,7,8) || node_size >= 64 || occursin(r"rel"i, node_name)
+end
 
-The subsampled snapshot will contain all nodes reachable from the nodes that are kept.
+subsample_snapshot(Returns(true), "profile1.heapsnapshot", trunc_strings_to=512)
+```
 """
-function subsample_snapshot(in_path, out_path=_default_outpath(in_path), always_keep_types=(0,), always_keep_size=1024*1024, sample_prob=0.1, trunc_strings_to=512*1024)
+function subsample_snapshot(f, in_path, out_path=_default_outpath(in_path); trunc_strings_to=nothing, mark_ancestors=false)
     @info "Reading snapshot from $(repr(in_path))"
     nodes, strings, backwards_edges = parse_nodes(in_path)
 
@@ -416,7 +430,7 @@ function subsample_snapshot(in_path, out_path=_default_outpath(in_path), always_
 
     print_sizes(nodes, strings, node_types)
 
-    filter_nodes!(nodes, backwards_edges, always_keep_types, always_keep_size, sample_prob)
+    filter_nodes!(f, nodes, strings, backwards_edges, mark_ancestors)
 
     print_sizes(nodes, strings, node_types)
 
