@@ -87,6 +87,7 @@ function _parse_edges_array!(nodes, file, pos, backwards_edges, options)
     n_node_fields = 7
     node_idx = UInt32(1)
     edges = nodes.edges
+    should_collect_backwards_edges = !isnothing(backwards_edges)
     for edge_count in nodes.edge_count
         for _ in 1:edge_count
             res1 = Parsers.xparse(Int8, file, pos, length(file), options)
@@ -104,7 +105,7 @@ function _parse_edges_array!(nodes, file, pos, backwards_edges, options)
 
             idx = div(to_node, n_node_fields) + true # convert an index in the nodes array to a node number
 
-            push!(backwards_edges[idx], node_idx)
+            should_collect_backwards_edges && push!(backwards_edges[idx], node_idx)
             index += 1
             edges.type[index] = edge_type
             edges.name_index[index] = edge_name_index
@@ -149,7 +150,7 @@ function _parse_and_assebmle_edges_array!(nodes, file, pos, edge_count, options)
 end
 
 _parseable(b) = !(UInt8(b) in (UInt8(' '), UInt8('\n'), UInt8('\r'), UInt8(',')))
-function parse_nodes(path)
+function parse_nodes(path, mark_ancestors=false)
     OPTIONS = Parsers.Options(delim=',', stripwhitespace=true, ignoreemptylines=true)
 
     file = Mmap.mmap(path; grow=false, shared=false)
@@ -167,7 +168,7 @@ function parse_nodes(path)
 
     pos = last(findnext(b"edges\":[", file, pos))+1
     pos = last(something(findnext(_parseable, file, pos), pos:pos))
-    backwards_edges = @time "backwards_edges" map(x->UInt32[], 1:length(nodes))
+    backwards_edges = mark_ancestors ? map(x->UInt32[], 1:length(nodes)) : nothing
     pos = _parse_edges_array!(nodes, file, pos, backwards_edges, OPTIONS)
 
     pos = last(findnext(b"strings\":", file, pos)) + 1
@@ -177,7 +178,7 @@ function parse_nodes(path)
     return nodes, strings, backwards_edges
 end
 
-function print_sizes(nodes, strings, node_types)
+function print_sizes(prefix, nodes, strings, node_types)
     let size_by_type = zeros(UInt, length(node_types)),
         count_by_type = zeros(Int, length(node_types))
 
@@ -192,7 +193,7 @@ function print_sizes(nodes, strings, node_types)
         end
         pad = maximum(length, node_types)
         sizes = join(string.(lpad.(node_types, pad), ": ", Base.format_bytes.(size_by_type), " (", count_by_type, ")"), "\n")
-        @info "Snapshot contains $(length(nodes)) nodes, $(length(nodes.edges)) edges, and $(length(strings)) strings.\nTotal size of nodes: $(Base.format_bytes(total_size))\n$sizes"
+        @info "$prefix Snapshot contains $(length(nodes)) nodes, $(length(nodes.edges)) edges, and $(length(strings)) strings.\nTotal size of nodes: $(Base.format_bytes(total_size))\n$sizes"
         return size_by_type
     end
 end
@@ -309,7 +310,7 @@ end
 function filter_strings(filtered_nodes, strings, edge_types_map, trunc_strings_to)
     strmap = Dict{String,Int}()
     new_strings = String[]
-    property = edge_types_map["property"]
+
     for (i, str) in enumerate(filtered_nodes.name_index)
         let s = strings[str+1]
             filtered_nodes.name_index[i] = get!(strmap, s) do
@@ -321,13 +322,14 @@ function filter_strings(filtered_nodes, strings, edge_types_map, trunc_strings_t
     edges = filtered_nodes.edges
     for (e, type) in enumerate(edges.type)
         # Edges pointing to an object use the index field to point to the field
-        # name in the parent struct.
-        if type == property
-            let s = strings[edges.name_index[e]+1]
-                edges.name_index[e] = get!(strmap, isnothing(trunc_strings_to) ? s : first(s, trunc_strings_to)) do
-                    push!(new_strings, s)
-                    length(new_strings) - 1
-                end
+        # name in the parent struct. Type 2 are edges pointing to an element of
+        # an array, so we don't need to update the name index.
+        type == 2 && continue
+        edge_name_idx = edges.name_index[e]
+        let s = strings[edge_name_idx+1]
+            edges.name_index[e] = get!(strmap, isnothing(trunc_strings_to) ? s : first(s, trunc_strings_to)) do
+                push!(new_strings, s)
+                length(new_strings) - 1
             end
         end
     end
@@ -415,12 +417,13 @@ subsample_snapshot("profile1.heapsnapshot") do node_type, node_size, node_name
     node_type in (0,1,2,6,7,8) || node_size >= 64 || occursin(r"rel"i, node_name)
 end
 
-subsample_snapshot(Returns(true), "profile1.heapsnapshot", trunc_strings_to=512)
+# Only truncates strings to 512 bytes
+subsample_snapshot((x...)->true, "profile1.heapsnapshot", trunc_strings_to=512)
 ```
 """
 function subsample_snapshot(f, in_path, out_path=_default_outpath(in_path); trunc_strings_to=nothing, mark_ancestors=false)
     @info "Reading snapshot from $(repr(in_path))"
-    nodes, strings, backwards_edges = parse_nodes(in_path)
+    nodes, strings, backwards_edges = parse_nodes(in_path, mark_ancestors)
 
     node_types = ["synthetic","jl_task_t","jl_module_t","jl_array_t","object","String","jl_datatype_t","jl_svec_t","jl_sym_t"]
     node_fields = ["type","name","id","self_size","edge_count","trace_node_id","detachedness"]
@@ -428,17 +431,17 @@ function subsample_snapshot(f, in_path, out_path=_default_outpath(in_path); trun
     edge_fields = ["type","name_or_index","to_node"]
     edge_types_map = Dict{String,Int}(str=>i-1 for (i, str) in enumerate(edge_types))
 
-    print_sizes(nodes, strings, node_types)
+    print_sizes("BEFORE: ", nodes, strings, node_types)
 
     filter_nodes!(f, nodes, strings, backwards_edges, mark_ancestors)
 
-    print_sizes(nodes, strings, node_types)
-
     new_strings = filter_strings(nodes, strings, edge_types_map, trunc_strings_to)
+
+    print_sizes("AFTER:  ", nodes, new_strings, node_types)
 
     @info "Writing snapshot to $(repr(out_path))"
     write_snapshot(out_path, nodes, node_fields, new_strings)
-    return nothing
+    return out_path
 end
 
 # # TODO: Rework this to match https://github.com/JuliaLang/julia/pull/51518
