@@ -307,7 +307,7 @@ function filter_nodes!(f, nodes, strings, backwards_edges, mark_ancestors=false)
     return nodes
 end
 
-function filter_strings(filtered_nodes, strings, edge_types_map, trunc_strings_to)
+function filter_strings(filtered_nodes, strings, trunc_strings_to)
     strmap = Dict{String,Int}()
     new_strings = String[]
 
@@ -400,7 +400,12 @@ end
 _default_outpath(in_path) = joinpath(dirname(in_path), string("subsampled_", basename(in_path)))
 
 """
-    subsample_snapshot(f, in_path, out_path; trunc_strings_to=nothing, mark_ancestors=false))
+    subsample_snapshot(f, in_path, out_path; trunc_strings_to=nothing, mark_ancestors=false)) -> String
+
+Subsamples a snapshot by filtering out nodes that don't match the predicate `f`.
+By default, the subsampled snapshot is written to the same directory as the original snapshot,
+with its name prefixed by "subsampled_". Returns the `out_path`.
+
 - `f`: A function used for filtering nodes. It should take the following arguments:
     - `node_type`: index into `snapshot.meta.node_types`
     - `node_size`: size of the object itself in bytes
@@ -413,7 +418,8 @@ _default_outpath(in_path) = joinpath(dirname(in_path), string("subsampled_", bas
 Example:
 ```julia
 subsample_snapshot("profile1.heapsnapshot") do node_type, node_size, node_name
-    # node types are 0 based indices into: ["synthetic","jl_task_t","jl_module_t","jl_array_t","object","String","jl_datatype_t","jl_svec_t","jl_sym_t"]
+    # node types are 0 based indices into:
+    # ["synthetic","jl_task_t","jl_module_t","jl_array_t","object","String","jl_datatype_t","jl_svec_t","jl_sym_t"]
     node_type in (0,1,2,6,7,8) || node_size >= 64 || occursin(r"rel"i, node_name)
 end
 
@@ -429,13 +435,12 @@ function subsample_snapshot(f, in_path, out_path=_default_outpath(in_path); trun
     node_fields = ["type","name","id","self_size","edge_count","trace_node_id","detachedness"]
     edge_types = ["internal","hidden","element","property"]
     edge_fields = ["type","name_or_index","to_node"]
-    edge_types_map = Dict{String,Int}(str=>i-1 for (i, str) in enumerate(edge_types))
 
     print_sizes("BEFORE: ", nodes, strings, node_types)
 
     filter_nodes!(f, nodes, strings, backwards_edges, mark_ancestors)
 
-    new_strings = filter_strings(nodes, strings, edge_types_map, trunc_strings_to)
+    new_strings = filter_strings(nodes, strings, trunc_strings_to)
 
     print_sizes("AFTER:  ", nodes, new_strings, node_types)
 
