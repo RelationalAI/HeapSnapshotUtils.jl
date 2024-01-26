@@ -104,7 +104,7 @@ function _parse_edges_array!(nodes, file, pos, children_edges, options)
 
             idx = div(to_node, n_node_fields) + true # convert an index in the nodes array to a node number
 
-            push!(children_edges[idx], node_idx)
+            push!(children_edges[node_idx], idx)
             index += 1
             edges.type[index] = edge_type
             edges.name_index[index] = edge_name_index
