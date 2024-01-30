@@ -82,7 +82,7 @@ function _parse_nodes_array!(nodes, file, pos, options)
     return pos
 end
 
-function _parse_edges_array!(nodes, file, pos, children_edges, options)
+function _parse_edges_array!(nodes, file, pos, options)
     index = 0
     n_node_fields = 7
     node_idx = UInt32(1)
@@ -104,7 +104,6 @@ function _parse_edges_array!(nodes, file, pos, children_edges, options)
 
             idx = div(to_node, n_node_fields) + true # convert an index in the nodes array to a node number
 
-            push!(children_edges[node_idx], idx)
             index += 1
             edges.type[index] = edge_type
             edges.name_index[index] = edge_name_index
@@ -167,14 +166,13 @@ function parse_nodes(path)
 
     pos = last(findnext(b"edges\":[", file, pos))+1
     pos = last(something(findnext(_parseable, file, pos), pos:pos))
-    children_edges = map(x->UInt32[], 1:length(nodes))
-    pos = _parse_edges_array!(nodes, file, pos, children_edges, OPTIONS)
+    pos = _parse_edges_array!(nodes, file, pos, OPTIONS)
 
     pos = last(findnext(b"strings\":", file, pos)) + 1
     pos = last(something(findnext(_parseable, file, pos), pos:pos))
     strings = JSON3.read(view(file, pos:length(file)), Vector{String})
 
-    return nodes, strings, children_edges
+    return nodes, strings
 end
 
 function print_sizes(prefix, nodes, strings, node_types)
@@ -214,9 +212,12 @@ function Base.get!(f::Function, n::NodeBitset, x::UInt32)
     end
 end
 
-function _mark!(seen, queue, node_idx, children_edges)
+function _mark!(seen, queue, node_idx, nodes, cumsum_edges)
     get!(seen, node_idx) do
-        for child_node_idx in children_edges[node_idx]
+        cumcnt = cumsum_edges[node_idx]
+        prev_cumcnt = get(cumsum_edges, node_idx-1, 0)
+
+        for child_node_idx in @view(nodes.edges.to_pos[prev_cumcnt+1:cumcnt])
             get!(seen, child_node_idx) do
                 push!(queue, child_node_idx)
             end
@@ -225,10 +226,11 @@ function _mark!(seen, queue, node_idx, children_edges)
     end
 end
 
-function filter_nodes!(f, nodes, strings, children_edges)
+function filter_nodes!(f, nodes, strings)
     to_filter_out = NodeBitset(length(nodes))
     node_idxs = UInt32(1):UInt32(length(nodes))
 
+    cumsum_edges = cumsum(nodes.edge_count)
     queue = UInt32[]
     for node_idx in node_idxs
         node_type = nodes.type[node_idx]
@@ -236,11 +238,11 @@ function filter_nodes!(f, nodes, strings, children_edges)
         node_name = strings[nodes.name_index[node_idx]+1]
         f(node_type, self_size, node_name) && continue
 
-        _mark!(to_filter_out, queue, node_idx, children_edges)
+        _mark!(to_filter_out, queue, node_idx, nodes, cumsum_edges)
 
         while !isempty(queue)
             n_idx = pop!(queue)
-            _mark!(to_filter_out, queue, n_idx, children_edges)
+            _mark!(to_filter_out, queue, n_idx, nodes, cumsum_edges)
         end
     end
 
@@ -425,7 +427,7 @@ subsample_snapshot((x...)->true, "profile1.heapsnapshot", trunc_strings_to=512)
 """
 function subsample_snapshot(f, in_path, out_path=_default_outpath(in_path); trunc_strings_to=nothing)
     @info "Reading snapshot from $(repr(in_path))"
-    nodes, strings, children_edges = parse_nodes(in_path)
+    nodes, strings = parse_nodes(in_path)
 
     node_types = ["synthetic","jl_task_t","jl_module_t","jl_array_t","object","String","jl_datatype_t","jl_svec_t","jl_sym_t"]
     node_fields = ["type","name","id","self_size","edge_count","trace_node_id","detachedness"]
@@ -434,7 +436,7 @@ function subsample_snapshot(f, in_path, out_path=_default_outpath(in_path); trun
 
     print_sizes("BEFORE: ", nodes, strings, node_types)
 
-    filter_nodes!(f, nodes, strings, children_edges)
+    filter_nodes!(f, nodes, strings)
 
     new_strings = filter_strings(nodes, strings, trunc_strings_to)
 
