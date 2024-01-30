@@ -13,31 +13,34 @@ using Test
         path_sample = subsample_snapshot((x...)->true, path_full)
         try
 
-            nodes_full, strings_full = HeapSnapshotUtils.parse_nodes(path_full)
-            nodes_sample, strings_sample = HeapSnapshotUtils.parse_nodes(path_sample)
+            nodes_full, strings_full, backwards_edges = HeapSnapshotUtils.parse_nodes(path_full)
+            nodes_sample, strings_sample, backwards_edges_sample  = HeapSnapshotUtils.parse_nodes(path_sample)
+            orphan_nodes = check_orphan_nodes_from_backward_edges(backwards_edges)
+            # the following tests only work if there are no orphan nodes in the input snapshot
+            if isempty(orphan_nodes)
+                @test length(nodes_full.type) == length(nodes_sample.type)
+                @test length(nodes_full.name_index) == length(nodes_sample.name_index)
+                @test length(nodes_full.id) == length(nodes_sample.id)
+                @test length(nodes_full.self_size) == length(nodes_sample.self_size)
+                @test length(nodes_full.edge_count) == length(nodes_sample.edge_count)
+                @test length(nodes_full.edges.type) == length(nodes_sample.edges.type)
+                @test length(nodes_full.edges.name_index) == length(nodes_sample.edges.name_index)
+                @test length(nodes_full.edges.to_pos) == length(nodes_sample.edges.to_pos)
+                @test length(strings_full) == length(strings_sample)
 
-            @test length(nodes_full.type) == length(nodes_sample.type)
-            @test length(nodes_full.name_index) == length(nodes_sample.name_index)
-            @test length(nodes_full.id) == length(nodes_sample.id)
-            @test length(nodes_full.self_size) == length(nodes_sample.self_size)
-            @test length(nodes_full.edge_count) == length(nodes_sample.edge_count)
-            @test length(nodes_full.edges.type) == length(nodes_sample.edges.type)
-            @test length(nodes_full.edges.name_index) == length(nodes_sample.edges.name_index)
-            @test length(nodes_full.edges.to_pos) == length(nodes_sample.edges.to_pos)
-            @test length(strings_full) == length(strings_sample)
-
-            # The order of strings is different after we write the snapshot out (even without filtering)
-            # So don't compare indices to strings but the strings themselves after lookup
-            @test nodes_full.type == nodes_sample.type
-            @test strings_full[nodes_full.name_index .+ 1] == strings_sample[nodes_sample.name_index .+ 1]
-            @test nodes_full.id == nodes_sample.id
-            @test nodes_full.self_size == nodes_sample.self_size
-            @test nodes_full.edge_count == nodes_sample.edge_count
-            @test nodes_full.edges.type == nodes_sample.edges.type
-            # edges.type .== 2 are indices into arrays which don't have a name
-            @test strings_full[nodes_full.edges.name_index[nodes_full.edges.type .!= 2] .+ 1] == strings_sample[nodes_sample.edges.name_index[nodes_full.edges.type .!= 2] .+ 1]
-            @test nodes_full.edges.to_pos == nodes_sample.edges.to_pos
-            @test sort(strings_full) == sort(strings_sample)
+                # The order of strings is different after we write the snapshot out (even without filtering)
+                # So don't compare indices to strings but the strings themselves after lookup
+                @test nodes_full.type == nodes_sample.type
+                @test strings_full[nodes_full.name_index .+ 1] == strings_sample[nodes_sample.name_index .+ 1]
+                @test nodes_full.id == nodes_sample.id
+                @test nodes_full.self_size == nodes_sample.self_size
+                @test nodes_full.edge_count == nodes_sample.edge_count
+                @test nodes_full.edges.type == nodes_sample.edges.type
+                # edges.type .== 2 are indices into arrays which don't have a name
+                @test strings_full[nodes_full.edges.name_index[nodes_full.edges.type .!= 2] .+ 1] == strings_sample[nodes_sample.edges.name_index[nodes_full.edges.type .!= 2] .+ 1]
+                @test nodes_full.edges.to_pos == nodes_sample.edges.to_pos
+                @test sort(strings_full) == sort(strings_sample)
+            end
         finally
             rm(path_sample, force=true)
         end
@@ -129,7 +132,9 @@ end
         end
         try
             nodes_sample, strings_sample = HeapSnapshotUtils.parse_nodes(path_sample)
-            @test all(==(4), nodes_sample.type)
+            # after preserving the parents of the nodes of type 4,
+            # we could have nodes of types other than 4
+            @test 4 in nodes_sample.type
         finally
             rm(path_sample, force=true)
         end
@@ -140,7 +145,8 @@ end
         end
         try
             nodes_sample, strings_sample = HeapSnapshotUtils.parse_nodes(path_sample)
-            @test all(<(64), nodes_sample.self_size)
+            filtered_sizes = filter(x -> x < 64, nodes_sample.self_size)
+            @test !isempty(filtered_sizes)
         finally
             rm(path_sample, force=true)
         end
@@ -151,10 +157,82 @@ end
         end
         try
             nodes_sample, strings_sample = HeapSnapshotUtils.parse_nodes(path_sample)
-            @test all(contains("Array"), strings_sample[nodes_sample.name_index .+ 1])
+            filtered_names = filter(x -> occursin("Array", x), strings_sample)
+            @test !isempty(filtered_names)
         finally
             rm(path_sample, force=true)
         end
+    end
+end
+
+@testset "check_orphan_nodes_from_backward_edges" begin
+    @testset "Empty backward edges" begin
+        backward_edges = Vector{Vector{UInt32}}()
+        expected = Set{Int32}()
+        actual = check_orphan_nodes_from_backward_edges(backward_edges)
+        @test actual == expected
+    end
+
+    @testset "No orphan nodes" begin
+        backward_edges = [[], [1], [1, 2], [3]]
+        actual = check_orphan_nodes_from_backward_edges(backward_edges)
+        @test isempty(actual)
+    end
+
+    @testset "Orphan nodes present" begin
+        backward_edges = [[], [1], [1, 2], [], [3], []]
+        actual = check_orphan_nodes_from_backward_edges(backward_edges)
+        @test !isempty(actual)
+        @test length(actual) == 2
+        @test 4 in actual
+        @test 6 in actual
+    end
+end
+
+@testset "check orphan nodes" begin
+    current_directory = pwd()
+    nodes_full, strings_full = HeapSnapshotUtils.parse_nodes("$(current_directory)/test/data/julia-test.heapsnapshot")
+    orphan_nodes = check_orphan_nodes(nodes_full)
+    @test isempty(orphan_nodes)
+
+    path_sample = subsample_snapshot("$(current_directory)/test/data/julia-test.heapsnapshot") do node_type, node_size, node_name
+        node_type in (1,2,3) && occursin(r"Tuple"i, node_name)
+    end
+
+    try
+        nodes_sample, strings_sample = HeapSnapshotUtils.parse_nodes(path_sample)
+        orphan_nodes = check_orphan_nodes(nodes_sample)
+        @test isempty(orphan_nodes)
+    finally
+        rm(path_sample, force=true)
+    end
+end
+
+@testset "get_backwards_edges" begin
+    current_directory = pwd()
+    nodes_full, strings_full, backward_edges = HeapSnapshotUtils.parse_nodes("$(current_directory)/test/data/julia-test.heapsnapshot")
+    new_backward_edges = get_backwards_edges(nodes_full)
+    @test length(backward_edges) == length(new_backward_edges)
+    for idx in eachindex(backward_edges)
+        @test backward_edges[idx] == new_backward_edges[idx]
+    end
+end
+
+@testset "subsample the snapshot" begin
+    current_directory = pwd()
+    path_sample = subsample_snapshot("$(current_directory)/test/data/julia-test.heapsnapshot") do node_type, node_size, node_name
+        node_type in (1,2,3) || occursin(r"Tuple"i, node_name)
+    end
+
+    try
+        nodes_sample, strings_sample = HeapSnapshotUtils.parse_nodes(path_sample)
+        @test 3 in nodes_sample.type
+        @test 2 in nodes_sample.type
+        @test 1 in nodes_sample.type
+        tuple_names = filter(x -> occursin(r"Tuple"i, x), strings_sample)
+        @test !isempty(tuple_names)
+    finally
+        rm(path_sample, force=true)
     end
 end
 

@@ -6,6 +6,10 @@ using Parsers
 using CodecZlibNG
 
 export subsample_snapshot, assemble_snapshot
+export check_orphan_nodes, check_orphan_nodes_from_backward_edges, get_backwards_edges
+
+const max_tries_fix_orphans::Int32 = 100 # maximum number of iterations to fix orphan nodes
+const uber_root_node_idx::UInt32 = 1 # index of the uber root node
 
 # SoA layout to help reduce field padding
 struct Edges
@@ -13,7 +17,7 @@ struct Edges
     name_index::Vector{UInt} # index into `snapshot.strings`
     to_pos::Vector{UInt32}   # index into `snapshot.nodes`
 end
-function init_edges(n::Int)
+function Edges(n::Int)
     Edges(
         Vector{Int8}(undef, n),
         Vector{UInt}(undef, n),
@@ -31,14 +35,14 @@ struct Nodes
     edge_count::Vector{UInt32} # number of outgoing edges
     edges::Edges               # outgoing edges
 end
-function init_nodes(n::Int, e::Int)
+function Nodes(n::Int, e::Int)
     Nodes(
         Vector{Int8}(undef, n),
         Vector{UInt32}(undef, n),
         Vector{UInt}(undef, n),
         Vector{Int}(undef, n),
         Vector{UInt32}(undef, n),
-        init_edges(e),
+        Edges(e),
     )
 end
 Base.length(n::Nodes) = length(n.type)
@@ -82,7 +86,7 @@ function _parse_nodes_array!(nodes, file, pos, options)
     return pos
 end
 
-function _parse_edges_array!(nodes, file, pos, options)
+function _parse_edges_array!(nodes, file, pos, backwards_edges, options)
     index = 0
     n_node_fields = 7
     node_idx = UInt32(1)
@@ -103,6 +107,7 @@ function _parse_edges_array!(nodes, file, pos, options)
             pos = last(something(findnext(_parseable, file, pos), pos:pos))
 
             idx = div(to_node, n_node_fields) + true # convert an index in the nodes array to a node number
+            push!(backwards_edges[idx], node_idx)
 
             index += 1
             edges.type[index] = edge_type
@@ -111,6 +116,7 @@ function _parse_edges_array!(nodes, file, pos, options)
         end
         node_idx += UInt32(1)
     end
+
     return pos
 end
 
@@ -161,18 +167,19 @@ function parse_nodes(path)
 
     pos = last(findnext(b"nodes\":[", file, pos))+1
     pos = last(something(findnext(_parseable, file, pos), pos:pos))
-    nodes = init_nodes(node_count, edge_count)
+    nodes = Nodes(node_count, edge_count)
     pos = _parse_nodes_array!(nodes, file, pos, OPTIONS)
 
     pos = last(findnext(b"edges\":[", file, pos))+1
     pos = last(something(findnext(_parseable, file, pos), pos:pos))
-    pos = _parse_edges_array!(nodes, file, pos, OPTIONS)
+    backwards_edges = map(x->UInt32[], 1:length(nodes))
+    pos = _parse_edges_array!(nodes, file, pos, backwards_edges, OPTIONS)
 
     pos = last(findnext(b"strings\":", file, pos)) + 1
     pos = last(something(findnext(_parseable, file, pos), pos:pos))
     strings = JSON3.read(view(file, pos:length(file)), Vector{String})
 
-    return nodes, strings
+    return nodes, strings, backwards_edges
 end
 
 function print_sizes(prefix, nodes, strings, node_types)
@@ -212,6 +219,15 @@ function Base.get!(f::Function, n::NodeBitset, x::UInt32)
     end
 end
 
+# reset the bit at index x to false if it's true
+function reset!(n::NodeBitset, x::UInt32)
+    @assert length(n.x) >= x "Invalid node index: $x, length: $(length(n.x))"
+    if n.x[x]
+        n.x[x] = false
+    end
+    return nothing
+end
+
 function _mark!(seen, queue, node_idx, nodes, cumsum_edges)
     get!(seen, node_idx) do
         cumcnt = cumsum_edges[node_idx]
@@ -222,30 +238,69 @@ function _mark!(seen, queue, node_idx, nodes, cumsum_edges)
                 push!(queue, child_node_idx)
             end
         end
-        return nothing
     end
+    return nothing
 end
 
-function filter_nodes!(f, nodes, strings)
-    to_filter_out = NodeBitset(length(nodes))
-    node_idxs = UInt32(1):UInt32(length(nodes))
+# check the nodes that don't have any parents except the uber root node
+function check_orphan_nodes_from_backward_edges(backwards_edges)
+    orphan_nodes = Set{UInt32}()
+    for i in 1:length(backwards_edges)
+        if isempty(backwards_edges[i]) && i != uber_root_node_idx
+            push!(orphan_nodes, i)
+        end
+    end
+    return orphan_nodes
+end
 
-    cumsum_edges = cumsum(nodes.edge_count)
+# We need to repair the parents of the nodes we're not filtering out, otherwise the
+# snapshot might include some orphan nodes.
+function reset_parents!(to_filter_out, orphan_nodes, backwards_edges)
+    if isempty(orphan_nodes)
+        return to_filter_out
+    end
+
     queue = UInt32[]
-    for node_idx in node_idxs
-        node_type = nodes.type[node_idx]
-        self_size = nodes.self_size[node_idx]
-        node_name = strings[nodes.name_index[node_idx]+1]
-        f(node_type, self_size, node_name) && continue
-
-        _mark!(to_filter_out, queue, node_idx, nodes, cumsum_edges)
-
+    for orphan_node_idx in orphan_nodes
+        if orphan_node_idx != uber_root_node_idx && length(backwards_edges[orphan_node_idx]) > 0
+            for parent_idx in backwards_edges[orphan_node_idx]
+                reset!(to_filter_out, parent_idx)
+                push!(queue, parent_idx)
+            end
+        end
         while !isempty(queue)
             n_idx = pop!(queue)
-            _mark!(to_filter_out, queue, n_idx, nodes, cumsum_edges)
+            if n_idx != uber_root_node_idx && length(backwards_edges[n_idx]) > 0
+                for parent_idx in backwards_edges[n_idx]
+                    if in(to_filter_out, parent_idx)
+                        reset!(to_filter_out, parent_idx)
+                        push!(queue, parent_idx)
+                    end
+                end
+            end
         end
     end
 
+    return to_filter_out
+end
+
+function get_backwards_edges(nodes)
+    backwards_edges = map(x->UInt32[], 1:length(nodes))
+    edges = nodes.edges
+    edge_idx = 0
+    for node_idx in 1:length(nodes)
+        edge_count = nodes.edge_count[node_idx]
+        for _ in 1:edge_count
+            edge_idx += 1
+            to_pos = edges.to_pos[edge_idx]
+            push!(backwards_edges[to_pos], node_idx)
+        end
+    end
+    return backwards_edges
+end
+
+function resize_nodes!(to_filter_out, nodes)
+    node_idxs = UInt32(1):UInt32(length(nodes))
     # Create an array that maps the old node index to the new node index
     new_pos = zeros(UInt32, length(nodes))
     new_node_idx = UInt32(0)
@@ -304,6 +359,120 @@ function filter_nodes!(f, nodes, strings)
     resize!(nodes.edge_count, new_node_idx)
 
     return nodes
+end
+
+function filter_nodes!(f, nodes, strings, backwards_edges)
+    to_filter_out = NodeBitset(length(nodes))
+    node_idxs = UInt32(1):UInt32(length(nodes))
+
+    cumsum_edges = cumsum(nodes.edge_count)
+    queue = UInt32[]
+    # filter out the nodes that don't match the condition specified by the function f()
+    for node_idx in node_idxs
+        node_type = nodes.type[node_idx]
+        self_size = nodes.self_size[node_idx]
+        node_name = strings[nodes.name_index[node_idx]+1]
+        f(node_type, self_size, node_name) && continue
+
+        _mark!(to_filter_out, queue, node_idx, nodes, cumsum_edges)
+
+        while !isempty(queue)
+            n_idx = pop!(queue)
+            _mark!(to_filter_out, queue, n_idx, nodes, cumsum_edges)
+        end
+    end
+
+    # the above filtering might result in orphan nodes since we operate on
+    # a complex graph structure with object cross references. We need to try
+    # to fix the parents of the orphan nodes to avoid orphan nodes in best effort
+    orphan_nodes = find_possible_orphan_nodes(to_filter_out, nodes)
+    count = 0
+    while length(orphan_nodes) > 0
+        count += 1
+        if count > max_tries_fix_orphans
+            @warn "Too many iterations to processing orphan node processing, breaking..."
+            break
+        end
+        @info "Attempting to fix parents for $(length(orphan_nodes)) orphan nodes..."
+        cur_to_filter_out = NodeBitset(copy(to_filter_out.x))
+        to_filter_out = reset_parents!(to_filter_out, orphan_nodes, backwards_edges)
+        # if we didn't change anything, we can break
+        if cur_to_filter_out.x == to_filter_out.x
+            @info "No changes can be done to fix parents, breaking..."
+            break
+        end
+        orphan_nodes = find_possible_orphan_nodes(to_filter_out, nodes)
+    end
+
+    # remove the nodes and related edges that we're filtering out
+    new_nodes = resize_nodes!(to_filter_out, nodes)
+    return new_nodes
+end
+
+# remove the orphan nodes and their children from the nodes array
+function remove_possible_orphan_nodes(orphan_nodes, nodes)
+    if isempty(orphan_nodes)
+        return nodes
+    end
+
+    to_filter_out = NodeBitset(length(nodes))
+    cumsum_edges = cumsum(nodes.edge_count)
+    queue = UInt32[]
+    for node_idx in orphan_nodes
+        _mark!(to_filter_out, queue, node_idx, nodes, cumsum_edges)
+
+        while !isempty(queue)
+            n_idx = pop!(queue)
+            _mark!(to_filter_out, queue, n_idx, nodes, cumsum_edges)
+        end
+    end
+    new_nodes = resize_nodes!(to_filter_out, nodes)
+    return new_nodes
+end
+
+function find_possible_orphan_nodes(to_filter_out, nodes)
+    node_idxs = UInt32(1):UInt32(length(nodes))
+    orphan_nodes = Set{UInt32}()
+    for node_idx in node_idxs
+        if !(node_idx in to_filter_out)
+            push!(orphan_nodes, node_idx)
+        end
+    end
+
+    cumsum_edges = cumsum(nodes.edge_count)
+    for node_idx in node_idxs
+        if !(node_idx in to_filter_out)
+            cumcnt = cumsum_edges[node_idx]
+            prev_cumcnt = get(cumsum_edges, node_idx-1, 0)
+            for child_node_idx in @view(nodes.edges.to_pos[prev_cumcnt+1:cumcnt])
+                if child_node_idx in orphan_nodes
+                    delete!(orphan_nodes, child_node_idx)
+                end
+            end
+        end
+    end
+
+    if uber_root_node_idx in orphan_nodes
+         delete!(orphan_nodes, uber_root_node_idx)
+    end
+
+    return orphan_nodes
+end
+
+function check_orphan_nodes(nodes)
+    node_idxs = UInt32(1):UInt32(length(nodes))
+    orphan_nodes = Set(node_idxs)
+    for idx in nodes.edges.to_pos
+        @assert idx in node_idxs
+        if idx in orphan_nodes
+            delete!(orphan_nodes, idx)
+        end
+    end
+    if uber_root_node_idx in orphan_nodes
+         delete!(orphan_nodes, uber_root_node_idx)
+    end
+
+    return orphan_nodes
 end
 
 function filter_strings(filtered_nodes, strings, trunc_strings_to)
@@ -427,7 +596,14 @@ subsample_snapshot((x...)->true, "profile1.heapsnapshot", trunc_strings_to=512)
 """
 function subsample_snapshot(f, in_path, out_path=_default_outpath(in_path); trunc_strings_to=nothing)
     @info "Reading snapshot from $(repr(in_path))"
-    nodes, strings = parse_nodes(in_path)
+    nodes, strings, backwards_edges = parse_nodes(in_path)
+
+    orphan_nodes = check_orphan_nodes_from_backward_edges(backwards_edges)
+    if !isempty(orphan_nodes)
+        @info "Input snapshot file contains $(length(orphan_nodes)) orphan nodes, processing orphan node removal"
+        nodes = remove_possible_orphan_nodes(orphan_nodes, nodes)
+        backwards_edges = get_backwards_edges(nodes)
+    end
 
     node_types = ["synthetic","jl_task_t","jl_module_t","jl_array_t","object","String","jl_datatype_t","jl_svec_t","jl_sym_t"]
     node_fields = ["type","name","id","self_size","edge_count","trace_node_id","detachedness"]
@@ -436,14 +612,18 @@ function subsample_snapshot(f, in_path, out_path=_default_outpath(in_path); trun
 
     print_sizes("BEFORE: ", nodes, strings, node_types)
 
-    filter_nodes!(f, nodes, strings)
+    new_nodes = filter_nodes!(f, nodes, strings, backwards_edges)
 
     new_strings = filter_strings(nodes, strings, trunc_strings_to)
+    orphan_nodes = check_orphan_nodes(new_nodes)
+    if !isempty(orphan_nodes)
+        @warn "Output snapshot contains $(length(orphan_nodes)) orphan nodes out of $(length(new_nodes)) nodes"
+    end
 
-    print_sizes("AFTER:  ", nodes, new_strings, node_types)
+    print_sizes("AFTER:  ", new_nodes, new_strings, node_types)
 
     @info "Writing snapshot to $(repr(out_path))"
-    write_snapshot(out_path, nodes, node_fields, new_strings)
+    write_snapshot(out_path, new_nodes, node_fields, new_strings)
     return out_path
 end
 
