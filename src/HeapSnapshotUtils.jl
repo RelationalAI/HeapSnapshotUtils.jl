@@ -82,12 +82,11 @@ function _parse_nodes_array!(nodes, file, pos, options)
     return pos
 end
 
-function _parse_edges_array!(nodes, file, pos, backwards_edges, options)
+function _parse_edges_array!(nodes, file, pos, options)
     index = 0
     n_node_fields = 7
     node_idx = UInt32(1)
     edges = nodes.edges
-    should_collect_backwards_edges = !isnothing(backwards_edges)
     for edge_count in nodes.edge_count
         for _ in 1:edge_count
             res1 = Parsers.xparse(Int8, file, pos, length(file), options)
@@ -105,7 +104,6 @@ function _parse_edges_array!(nodes, file, pos, backwards_edges, options)
 
             idx = div(to_node, n_node_fields) + true # convert an index in the nodes array to a node number
 
-            should_collect_backwards_edges && push!(backwards_edges[idx], node_idx)
             index += 1
             edges.type[index] = edge_type
             edges.name_index[index] = edge_name_index
@@ -150,7 +148,7 @@ function _parse_and_assebmle_edges_array!(nodes, file, pos, edge_count, options)
 end
 
 _parseable(b) = !(UInt8(b) in (UInt8(' '), UInt8('\n'), UInt8('\r'), UInt8(',')))
-function parse_nodes(path, mark_ancestors=false)
+function parse_nodes(path)
     OPTIONS = Parsers.Options(delim=',', stripwhitespace=true, ignoreemptylines=true)
 
     file = Mmap.mmap(path; grow=false, shared=false)
@@ -168,14 +166,13 @@ function parse_nodes(path, mark_ancestors=false)
 
     pos = last(findnext(b"edges\":[", file, pos))+1
     pos = last(something(findnext(_parseable, file, pos), pos:pos))
-    backwards_edges = mark_ancestors ? map(x->UInt32[], 1:length(nodes)) : nothing
-    pos = _parse_edges_array!(nodes, file, pos, backwards_edges, OPTIONS)
+    pos = _parse_edges_array!(nodes, file, pos, OPTIONS)
 
     pos = last(findnext(b"strings\":", file, pos)) + 1
     pos = last(something(findnext(_parseable, file, pos), pos:pos))
     strings = JSON3.read(view(file, pos:length(file)), Vector{String})
 
-    return nodes, strings, backwards_edges
+    return nodes, strings
 end
 
 function print_sizes(prefix, nodes, strings, node_types)
@@ -215,23 +212,25 @@ function Base.get!(f::Function, n::NodeBitset, x::UInt32)
     end
 end
 
-function _mark!(seen, queue, node_idx, backwards_edges, mark_ancestors=false)
+function _mark!(seen, queue, node_idx, nodes, cumsum_edges)
     get!(seen, node_idx) do
-        if mark_ancestors
-            for parent_node_idx in backwards_edges[node_idx]
-                get!(seen, parent_node_idx) do
-                    push!(queue, parent_node_idx)
-                end
+        cumcnt = cumsum_edges[node_idx]
+        prev_cumcnt = get(cumsum_edges, node_idx-1, 0)
+
+        for child_node_idx in @view(nodes.edges.to_pos[prev_cumcnt+1:cumcnt])
+            get!(seen, child_node_idx) do
+                push!(queue, child_node_idx)
             end
         end
         return nothing
     end
 end
 
-function filter_nodes!(f, nodes, strings, backwards_edges, mark_ancestors=false)
+function filter_nodes!(f, nodes, strings)
     to_filter_out = NodeBitset(length(nodes))
     node_idxs = UInt32(1):UInt32(length(nodes))
 
+    cumsum_edges = cumsum(nodes.edge_count)
     queue = UInt32[]
     for node_idx in node_idxs
         node_type = nodes.type[node_idx]
@@ -239,11 +238,11 @@ function filter_nodes!(f, nodes, strings, backwards_edges, mark_ancestors=false)
         node_name = strings[nodes.name_index[node_idx]+1]
         f(node_type, self_size, node_name) && continue
 
-        _mark!(to_filter_out, queue, node_idx, backwards_edges, mark_ancestors)
+        _mark!(to_filter_out, queue, node_idx, nodes, cumsum_edges)
 
         while !isempty(queue)
-            node_idx = pop!(queue)
-            _mark!(to_filter_out, queue, node_idx, backwards_edges, mark_ancestors)
+            n_idx = pop!(queue)
+            _mark!(to_filter_out, queue, n_idx, nodes, cumsum_edges)
         end
     end
 
@@ -400,7 +399,7 @@ end
 _default_outpath(in_path) = joinpath(dirname(in_path), string("subsampled_", basename(in_path)))
 
 """
-    subsample_snapshot(f, in_path, out_path; trunc_strings_to=nothing, mark_ancestors=false)) -> String
+    subsample_snapshot(f, in_path, out_path; trunc_strings_to=nothing)) -> String
 
 Subsamples a snapshot by filtering out nodes that don't match the predicate `f`.
 By default, the subsampled snapshot is written to the same directory as the original snapshot,
@@ -413,7 +412,6 @@ with its name prefixed by "subsampled_". Returns the `out_path`.
 - `in_path`: path to the snapshot to subsample
 - `out_path`: where to write the subsampled snapshot
 - `trunc_strings_to`: if not `nothing`, strings will be truncated to this length
-- `mark_ancestors`: if `true`, all ancestors of filtered nodes will also be filtered out
 
 Example:
 ```julia
@@ -427,9 +425,9 @@ end
 subsample_snapshot((x...)->true, "profile1.heapsnapshot", trunc_strings_to=512)
 ```
 """
-function subsample_snapshot(f, in_path, out_path=_default_outpath(in_path); trunc_strings_to=nothing, mark_ancestors=false)
+function subsample_snapshot(f, in_path, out_path=_default_outpath(in_path); trunc_strings_to=nothing)
     @info "Reading snapshot from $(repr(in_path))"
-    nodes, strings, backwards_edges = parse_nodes(in_path, mark_ancestors)
+    nodes, strings = parse_nodes(in_path)
 
     node_types = ["synthetic","jl_task_t","jl_module_t","jl_array_t","object","String","jl_datatype_t","jl_svec_t","jl_sym_t"]
     node_fields = ["type","name","id","self_size","edge_count","trace_node_id","detachedness"]
@@ -438,7 +436,7 @@ function subsample_snapshot(f, in_path, out_path=_default_outpath(in_path); trun
 
     print_sizes("BEFORE: ", nodes, strings, node_types)
 
-    filter_nodes!(f, nodes, strings, backwards_edges, mark_ancestors)
+    filter_nodes!(f, nodes, strings)
 
     new_strings = filter_strings(nodes, strings, trunc_strings_to)
 

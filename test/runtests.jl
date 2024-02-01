@@ -13,8 +13,8 @@ using Test
         path_sample = subsample_snapshot((x...)->true, path_full)
         try
 
-            nodes_full, strings_full, backwards_edges_full = HeapSnapshotUtils.parse_nodes(path_full, true)
-            nodes_sample, strings_sample, backwards_edges_sample = HeapSnapshotUtils.parse_nodes(path_sample, true)
+            nodes_full, strings_full = HeapSnapshotUtils.parse_nodes(path_full)
+            nodes_sample, strings_sample = HeapSnapshotUtils.parse_nodes(path_sample)
 
             @test length(nodes_full.type) == length(nodes_sample.type)
             @test length(nodes_full.name_index) == length(nodes_sample.name_index)
@@ -38,8 +38,6 @@ using Test
             @test strings_full[nodes_full.edges.name_index[nodes_full.edges.type .!= 2] .+ 1] == strings_sample[nodes_sample.edges.name_index[nodes_full.edges.type .!= 2] .+ 1]
             @test nodes_full.edges.to_pos == nodes_sample.edges.to_pos
             @test sort(strings_full) == sort(strings_sample)
-
-            @test backwards_edges_full == backwards_edges_sample
         finally
             rm(path_sample, force=true)
         end
@@ -55,15 +53,15 @@ end
 
         path_sample = subsample_snapshot((x...)->rand() < 0.5, path_full)
         try
-            nodes_full, strings_full, _ = HeapSnapshotUtils.parse_nodes(path_full)
-            nodes_sample, strings_sample, _ = HeapSnapshotUtils.parse_nodes(path_sample)
+            nodes_full, strings_full = HeapSnapshotUtils.parse_nodes(path_full)
+            nodes_sample, strings_sample = HeapSnapshotUtils.parse_nodes(path_sample)
 
             # Test that the sample is roughly 50% of the full snapshot
-            @test 0.45length(nodes_full.type) <= length(nodes_sample.type) <= 0.55length(nodes_full.type)
-            @test 0.45length(nodes_full.name_index) <= length(nodes_sample.name_index) <= 0.55length(nodes_full.name_index)
-            @test 0.45length(nodes_full.id) <= length(nodes_sample.id) <= 0.55length(nodes_full.id)
-            @test 0.45length(nodes_full.self_size) <= length(nodes_sample.self_size) <= 0.55length(nodes_full.self_size)
-            @test 0.45length(nodes_full.edge_count) <= length(nodes_sample.edge_count) <= 0.55length(nodes_full.edge_count)
+            @test 0.25length(nodes_full.type) <= length(nodes_sample.type) <= 0.55length(nodes_full.type)
+            @test 0.25length(nodes_full.name_index) <= length(nodes_sample.name_index) <= 0.55length(nodes_full.name_index)
+            @test 0.25length(nodes_full.id) <= length(nodes_sample.id) <= 0.55length(nodes_full.id)
+            @test 0.25length(nodes_full.self_size) <= length(nodes_sample.self_size) <= 0.55length(nodes_full.self_size)
+            @test 0.25length(nodes_full.edge_count) <= length(nodes_sample.edge_count) <= 0.55length(nodes_full.edge_count)
 
             # It is less clear what is the expected ratio for edges and strings
             @test length(nodes_sample.edges.type) <= length(nodes_full.edges.type)
@@ -130,7 +128,7 @@ end
             node_type == 4
         end
         try
-            nodes_sample, strings_sample, _ = HeapSnapshotUtils.parse_nodes(path_sample)
+            nodes_sample, strings_sample = HeapSnapshotUtils.parse_nodes(path_sample)
             @test all(==(4), nodes_sample.type)
         finally
             rm(path_sample, force=true)
@@ -141,7 +139,7 @@ end
             node_size < 64
         end
         try
-            nodes_sample, strings_sample, _ = HeapSnapshotUtils.parse_nodes(path_sample)
+            nodes_sample, strings_sample = HeapSnapshotUtils.parse_nodes(path_sample)
             @test all(<(64), nodes_sample.self_size)
         finally
             rm(path_sample, force=true)
@@ -152,7 +150,7 @@ end
             occursin("Array", node_name)
         end
         try
-            nodes_sample, strings_sample, _ = HeapSnapshotUtils.parse_nodes(path_sample)
+            nodes_sample, strings_sample = HeapSnapshotUtils.parse_nodes(path_sample)
             @test all(contains("Array"), strings_sample[nodes_sample.name_index .+ 1])
         finally
             rm(path_sample, force=true)
