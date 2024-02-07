@@ -8,38 +8,38 @@ mktemp() do path, io
     Profile.take_heap_snapshot(io)
     flush(io)
     close(io)
-    # Subsample the snapshot by removing nodes representing objects and strings which smaller 
-    # than 64 bytes and don't contain the string "Tuple" in their name (not relevant for strings).
+    # Subsample the snapshot by removing nodes representing objects and strings which are smaller 
+    # than 64 bytes.
     # By default, the subsample snapshot is written to the same directory as the original snapshot, with its
     # name prefixed by "subsampled_".
     subsample_snapshot(path) do node_type, node_self_size, node_name
     # node types are 0 based indices into: 
     # ["synthetic", "jl_task_t", "jl_module_t", "jl_array_t", "object","String","jl_datatype_t", "jl_svec_t", "jl_sym_t"]
-        node_type in (0,1,2,3,6,7,8) || (node_self_size >= 64) || occursin(r"Tuple"i, node_name)
+        node_type in (0,1,2,3,6,7,8) || (node_self_size >= 64)
     end
 end
-# [ Info: Reading snapshot from "/var/folders/jq/n4hkdx3968z1qw60dlgzgmnr0000gn/T/jl_lE8ntj"
-# ┌ Info: BEFORE:  Snapshot contains 1733005 nodes, 5304569 edges, and 371024 strings.
-# │ Total size of nodes: 218.551 MiB
-# │     synthetic: 73 bytes (74)
-# │     jl_task_t: 7.125 KiB (19)
+# [ Info: Reading snapshot from "/var/folders/jq/n4hkdx3968z1qw60dlgzgmnr0000gn/T/jl_R4PJNc"
+# ┌ Info: BEFORE:  Snapshot contains 1699809 nodes, 5225819 edges, and 372462 strings.
+# │ Total size of nodes: 218.828 MiB
+# │     synthetic: 54 bytes (55)
+# │     jl_task_t: 3.750 KiB (10)
 # │   jl_module_t: 54.344 KiB (148)
-# │    jl_array_t: 7.841 MiB (171300)
-# │        object: 58.453 MiB (715970)
-# │        String: 129.973 MiB (418926)
-# │ jl_datatype_t: 11.333 MiB (185679)
-# │     jl_svec_t: 675.999 KiB (30986)
-# └      jl_sym_t: 10.230 MiB (209903)
-# ┌ Info: AFTER:   Snapshot contains 1189977 nodes, 3815437 edges, and 257062 strings.
-# │ Total size of nodes: 204.194 MiB
-# │     synthetic: 73 bytes (74)
-# │     jl_task_t: 7.125 KiB (19)
+# │    jl_array_t: 7.364 MiB (160875)
+# │        object: 58.904 MiB (693604)
+# │        String: 130.472 MiB (422354)
+# │ jl_datatype_t: 11.229 MiB (183973)
+# │     jl_svec_t: 674.909 KiB (30925)
+# └      jl_sym_t: 10.142 MiB (207865)
+# ┌ Info: AFTER:   Snapshot contains 897672 nodes, 3173711 edges, and 187713 strings.
+# │ Total size of nodes: 166.966 MiB
+# │     synthetic: 54 bytes (55)
+# │     jl_task_t: 2.625 KiB (7)
 # │   jl_module_t: 54.344 KiB (148)
-# │    jl_array_t: 7.841 MiB (171300)
-# │        object: 50.706 MiB (403530)
-# │        String: 123.363 MiB (188338)
-# │ jl_datatype_t: 11.333 MiB (185679)
-# │     jl_svec_t: 675.999 KiB (30986)
-# └      jl_sym_t: 10.230 MiB (209903)
-# [ Info: Writing snapshot to "/var/folders/jq/n4hkdx3968z1qw60dlgzgmnr0000gn/T/subsampled_jl_lE8ntj"
+# │    jl_array_t: 5.400 MiB (117971)
+# │        object: 41.002 MiB (320353)
+# │        String: 102.871 MiB (133186)
+# │ jl_datatype_t: 8.579 MiB (140558)
+# │     jl_svec_t: 602.469 KiB (27606)
+# └      jl_sym_t: 8.470 MiB (157788)
+# [ Info: Writing snapshot to "/var/folders/jq/n4hkdx3968z1qw60dlgzgmnr0000gn/T/subsampled_jl_R4PJNc"
 ```

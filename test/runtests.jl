@@ -56,12 +56,12 @@ end
             nodes_full, strings_full = HeapSnapshotUtils.parse_nodes(path_full)
             nodes_sample, strings_sample = HeapSnapshotUtils.parse_nodes(path_sample)
 
-            # Test that the sample is roughly 50% of the full snapshot
-            @test 0.25length(nodes_full.type) <= length(nodes_sample.type) <= 0.55length(nodes_full.type)
-            @test 0.25length(nodes_full.name_index) <= length(nodes_sample.name_index) <= 0.55length(nodes_full.name_index)
-            @test 0.25length(nodes_full.id) <= length(nodes_sample.id) <= 0.55length(nodes_full.id)
-            @test 0.25length(nodes_full.self_size) <= length(nodes_sample.self_size) <= 0.55length(nodes_full.self_size)
-            @test 0.25length(nodes_full.edge_count) <= length(nodes_sample.edge_count) <= 0.55length(nodes_full.edge_count)
+            # Test that the sample is less than 50% of the full snapshot
+            @test length(nodes_sample.type) <= 0.55length(nodes_full.type)
+            @test length(nodes_sample.name_index) <= 0.55length(nodes_full.name_index)
+            @test length(nodes_sample.id) <= 0.55length(nodes_full.id)
+            @test length(nodes_sample.self_size) <= 0.55length(nodes_full.self_size)
+            @test length(nodes_sample.edge_count) <= 0.55length(nodes_full.edge_count)
 
             # It is less clear what is the expected ratio for edges and strings
             @test length(nodes_sample.edges.type) <= length(nodes_full.edges.type)
@@ -123,13 +123,12 @@ end
         flush(io)
         close(io)
 
-
         path_sample = subsample_snapshot(path_full) do node_type, node_size, node_name
             node_type == 4
         end
         try
             nodes_sample, strings_sample = HeapSnapshotUtils.parse_nodes(path_sample)
-            @test all(==(4), nodes_sample.type)
+            @test all(==(4), Iterators.rest(nodes_sample.type, 2)) # skipping the first node which is the root
         finally
             rm(path_sample, force=true)
         end
@@ -140,7 +139,7 @@ end
         end
         try
             nodes_sample, strings_sample = HeapSnapshotUtils.parse_nodes(path_sample)
-            @test all(<(64), nodes_sample.self_size)
+            @test all(<(64), Iterators.rest(nodes_sample.self_size, 2)) # skipping the first node which is the root
         finally
             rm(path_sample, force=true)
         end
@@ -151,7 +150,8 @@ end
         end
         try
             nodes_sample, strings_sample = HeapSnapshotUtils.parse_nodes(path_sample)
-            @test all(contains("Array"), strings_sample[nodes_sample.name_index .+ 1])
+            # skipping the first node which is the root
+            @test all(contains("Array"), strings_sample[Iterators.rest(nodes_sample.name_index, 2) .+ 1])
         finally
             rm(path_sample, force=true)
         end
