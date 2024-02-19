@@ -5,7 +5,7 @@ using Mmap
 using Parsers
 using CodecZlibNG
 
-export subsample_snapshot, assemble_snapshot
+export subsample_snapshot
 
 # SoA layout to help reduce field padding
 struct Edges
@@ -13,7 +13,7 @@ struct Edges
     name_index::Vector{UInt} # index into `snapshot.strings`
     to_pos::Vector{UInt32}   # index into `snapshot.nodes`
 end
-function init_edges(n::Int)
+function Edges(::UndefInitializer, n::Int)
     Edges(
         Vector{Int8}(undef, n),
         Vector{UInt}(undef, n),
@@ -24,21 +24,23 @@ Base.length(n::Edges) = length(n.type)
 
 # trace_node_id and detachedness are always 0 in the snapshots Julia produces so we don't store them
 struct Nodes
-    type::Vector{Int8}         # index in index into `snapshot.meta.node_types`
-    name_index::Vector{UInt32} # index in `snapshot.strings`
-    id::Vector{UInt}           # unique id, in julia it is the address of the object
-    self_size::Vector{Int}     # size of the object itself, not including the size of its fields
-    edge_count::Vector{UInt32} # number of outgoing edges
-    edges::Edges               # outgoing edges
+    type::Vector{Int8}          # index in index into `snapshot.meta.node_types`
+    name_index::Vector{UInt32}  # index in `snapshot.strings`
+    id::Vector{UInt}            # unique id, in julia it is the address of the object
+    self_size::Vector{Int}      # size of the object itself, not including the size of its fields
+    edge_count::Vector{UInt32}  # number of outgoing edges
+    _back_count::Vector{UInt32} # number of inbound edges (not a part of the snapshot format, but useful for filtering nodes)
+    edges::Edges                # outgoing edges
 end
-function init_nodes(n::Int, e::Int)
+function Nodes(::UndefInitializer, n::Int, e::Int)
     Nodes(
         Vector{Int8}(undef, n),
         Vector{UInt32}(undef, n),
         Vector{UInt}(undef, n),
         Vector{Int}(undef, n),
         Vector{UInt32}(undef, n),
-        init_edges(e),
+        zeros(UInt32, n),
+        Edges(undef, e),
     )
 end
 Base.length(n::Nodes) = length(n.type)
@@ -108,42 +110,28 @@ function _parse_edges_array!(nodes, file, pos, options)
             edges.type[index] = edge_type
             edges.name_index[index] = edge_name_index
             edges.to_pos[index] = idx
+            nodes._back_count[idx] += UInt32(1)
         end
         node_idx += UInt32(1)
     end
-    return pos
-end
 
-# In the streaming format, edges contain a fourth column which stores the index of the source node.
-# The third column, to_node, is also different as it stores the nodes' number, but the index in the nodes array.
-# Nodes always have 0 edge_count so we need to updat them here.
-function _parse_and_assebmle_edges_array!(nodes, file, pos, edge_count, options)
-    index = 0
-    edges = nodes.edges
-    for _ in 1:edge_count
-        res1 = Parsers.xparse(Int8, file, pos, length(file), options)
-        edge_type = res1.val
-        pos += res1.tlen
+    # NOTE: if we ever need to also find the `from_pos` edges, we can do the following:
+    # cumback = Vector{UInt32}(undef, length(nodes))
+    # cumback = cumsum!(cumback, nodes._back_count)
+    # fill!(nodes._back_count, 0)
 
-        res2 = Parsers.xparse(UInt, file, pos, length(file), options)
-        edge_name_index = res2.val
-        pos += res2.tlen
+    # index = 0
+    # node_idx = UInt32(0)
+    # for edge_count in nodes.edge_count
+    #     node_idx += UInt32(1)
+    #     for _ in 1:edge_count
+    #         index += 1
+    #         idx = edges.to_pos[index]
+    #         prev_cumcnt = get(cumback, idx-1, 0)
 
-        res3 = Parsers.xparse(UInt32, file, pos, length(file), options)
-        to_node = res3.val
-        pos += res3.tlen
-
-        res4 = Parsers.xparse(UInt32, file, pos, length(file), options)
-        from_node = res4.val
-        pos += res4.tlen
-        pos = last(something(findnext(_parseable, file, pos), pos:pos))
-
-        index += 1
-        edges.type[index] = edge_type
-        edges.name_index[index] = edge_name_index
-        edges.to_pos[index] = to_node + true
-        nodes.edge_count[from_node+1] += 1
-    end
+    #         edges.from_pos[prev_cumcnt + (nodes._back_count[idx] += UInt32(1))] = node_idx
+    #     end
+    # end
     return pos
 end
 
@@ -161,7 +149,7 @@ function parse_nodes(path)
 
     pos = last(findnext(b"nodes\":[", file, pos))+1
     pos = last(something(findnext(_parseable, file, pos), pos:pos))
-    nodes = init_nodes(node_count, edge_count)
+    nodes = Nodes(undef, node_count, edge_count)
     pos = _parse_nodes_array!(nodes, file, pos, OPTIONS)
 
     pos = last(findnext(b"edges\":[", file, pos))+1
@@ -218,8 +206,15 @@ function _mark!(seen, queue, node_idx, nodes, cumsum_edges)
         prev_cumcnt = get(cumsum_edges, node_idx-1, 0)
 
         for child_node_idx in @view(nodes.edges.to_pos[prev_cumcnt+1:cumcnt])
-            get!(seen, child_node_idx) do
-                push!(queue, child_node_idx)
+            if !(child_node_idx in seen)
+                new_back = nodes._back_count[child_node_idx] -= 1
+                if iszero(new_back) # Is there no longer a path from the root to this child node?
+                    if nodes.edge_count[child_node_idx] > 0 # Are there descendants we need to remove?
+                        push!(queue, child_node_idx)
+                    else
+                        push!(seen, child_node_idx)
+                    end
+                end
             end
         end
         return nothing
@@ -231,8 +226,8 @@ function filter_nodes!(f, nodes, strings)
     node_idxs = UInt32(1):UInt32(length(nodes))
 
     cumsum_edges = cumsum(nodes.edge_count)
-    queue = UInt32[]
-    for node_idx in node_idxs
+    queue = sizehint!(UInt32[], length(nodes)) # we later reuse this array to re-map node indices
+    for node_idx in Iterators.rest(node_idxs, 1) # never attemp to filter out the root
         node_type = nodes.type[node_idx]
         self_size = nodes.self_size[node_idx]
         node_name = strings[nodes.name_index[node_idx]+1]
@@ -246,8 +241,8 @@ function filter_nodes!(f, nodes, strings)
         end
     end
 
-    # Create an array that maps the old node index to the new node index
-    new_pos = zeros(UInt32, length(nodes))
+    # Re-maps the old node index to the new node index
+    new_pos = resize!(queue, length(nodes))
     new_node_idx = UInt32(0)
     for node_idx in node_idxs
         if !(node_idx in to_filter_out)
@@ -285,7 +280,7 @@ function filter_nodes!(f, nodes, strings)
     resize!(edges.name_index, new_edge_idx)
     resize!(edges.to_pos, new_edge_idx)
 
-    # Update the nodes array
+    # Update the nodes array (we don't bother updating the _back_count array as it is not needed anymore)
     new_node_idx = 0
     for node_idx in node_idxs
         if !(node_idx in to_filter_out)
@@ -306,6 +301,9 @@ function filter_nodes!(f, nodes, strings)
     return nodes
 end
 
+_trunc_string(s, n) = ncodeunits(s) > n ? first(s, n) : s
+_trunc_string(s, ::Nothing) = s
+
 function filter_strings(filtered_nodes, strings, trunc_strings_to)
     strmap = Dict{String,Int}()
     new_strings = String[]
@@ -313,7 +311,7 @@ function filter_strings(filtered_nodes, strings, trunc_strings_to)
     for (i, str) in enumerate(filtered_nodes.name_index)
         let s = strings[str+1]
             filtered_nodes.name_index[i] = get!(strmap, s) do
-                push!(new_strings, isnothing(trunc_strings_to) ? s : first(s, trunc_strings_to))
+                push!(new_strings, _trunc_string(s, trunc_strings_to))
                 length(new_strings) - 1
             end
         end
@@ -326,7 +324,7 @@ function filter_strings(filtered_nodes, strings, trunc_strings_to)
         type == 2 && continue
         edge_name_idx = edges.name_index[e]
         let s = strings[edge_name_idx+1]
-            edges.name_index[e] = get!(strmap, isnothing(trunc_strings_to) ? s : first(s, trunc_strings_to)) do
+            edges.name_index[e] = get!(strmap, _trunc_string(s, trunc_strings_to)) do
                 push!(new_strings, s)
                 length(new_strings) - 1
             end
@@ -446,50 +444,5 @@ function subsample_snapshot(f, in_path, out_path=_default_outpath(in_path); trun
     write_snapshot(out_path, nodes, node_fields, new_strings)
     return out_path
 end
-
-# # TODO: Rework this to match https://github.com/JuliaLang/julia/pull/51518
-# function _default_assembled_outpath(in_prefix, compress)
-#     gz_ext = compress ? ".gz" : ""
-#     ext = endswith(in_prefix, ".heapsnapshot") ? gz_ext : ".heapsnapshot$gz_ext"
-#     isempty(ext) ? in_prefix : string(in_prefix, ext)
-# end
-
-
-# """
-#     assemble_snapshot(in_prefix, out_path=in_prefix)
-
-# `in_prefix` is the shared common prefix of inputs, e.g. for:
-#     - "./streaming_snapshot/2023-09-20T23_40_25.462.edges"
-#     - "./streaming_snapshot/2023-09-20T23_40_25.462.nodes"
-#     - "./streaming_snapshot/2023-09-20T23_40_25.462.strings"
-#     - "./streaming_snapshot/2023-09-20T23_40_25.462.json"
-#   the `in_prefix` should be "./streaming_snapshot/2023-09-20T23_40_25.462"
-# `out_path`: where to write the assembled snapshot.
-#      Chrome will complain the file extension is not ".heapsnapshot"
-# """
-# function assemble_snapshot(in_prefix, out_path=nothing, compress=false)
-#     if isnothing(out_path)
-#         out_path = _default_assembled_outpath(in_prefix, compress)
-#     end
-#     @info "Reading snapshot from \"$in_prefix{.json,.nodes,.edges,.strings}\""
-#     preamble = JSON3.read(string(in_prefix, ".json"))
-#     node_count = preamble.snapshot.node_count
-#     edge_count = preamble.snapshot.edge_count
-#     node_fields = collect(preamble.snapshot.meta.node_fields)
-
-#     nodes = init_nodes(node_count, edge_count)
-#     OPTIONS = Parsers.Options(delim=',', stripwhitespace=true, ignoreemptylines=true)
-
-#     node_file = Mmap.mmap(string(in_prefix, ".nodes"); grow=false, shared=false)
-#     _parse_nodes_array!(nodes, node_file, 1, OPTIONS)
-
-#     edges_file = Mmap.mmap(string(in_prefix, ".edges"); grow=false, shared=false)
-#     _parse_and_assebmle_edges_array!(nodes, edges_file, 1, edge_count, OPTIONS)
-
-#     strings = JSON3.read(string(in_prefix, ".strings")).strings;
-
-#     @info "Writing snapshot to   $(repr(out_path))"
-#     write_snapshot(out_path, nodes, node_fields, strings)
-# end
 
 end # module HeapSnapshotUtils
