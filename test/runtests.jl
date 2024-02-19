@@ -111,6 +111,14 @@ end
                 @test strings_full[nodes_full.edges.name_index[full_edge_idxs][non_elements_samples] .+ 1] == strings_sample[nodes_sample.edges.name_index[sampled_edge_idx_range][non_elements_full] .+ 1]
             end
 
+            @testset "No new orphan nodes are introduced" begin
+                for i in 1:length(nodes_sample)
+                    nodes_sample._back_count[i] > 0 && continue
+                    nodes_full._back_count[id_to_pos[nodes_sample.id[i]]] == 0 && continue
+                    @test false
+                end
+            end
+
         finally
             rm(path_sample, force=true)
         end
@@ -146,12 +154,12 @@ end
 
 
         path_sample = subsample_snapshot(path_full) do node_type, node_size, node_name
-            occursin("Array", node_name)
+            occursin("Task", node_name)
         end
         try
             nodes_sample, strings_sample = HeapSnapshotUtils.parse_nodes(path_sample)
             # skipping the first node which is the root
-            @test all(contains("Array"), strings_sample[Iterators.rest(nodes_sample.name_index, 2) .+ 1])
+            @test all(contains("Task"), strings_sample[Iterators.rest(nodes_sample.name_index, 2) .+ 1])
         finally
             rm(path_sample, force=true)
         end
