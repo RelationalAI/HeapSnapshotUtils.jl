@@ -4,8 +4,9 @@ using JSON3
 using Mmap
 using Parsers
 using CodecZlibNG
+using Profile
 
-export subsample_snapshot, show_nodes
+export subsample_snapshot, browse
 
 # SoA layout to help reduce field padding
 struct Edges
@@ -78,18 +79,36 @@ function fill_back_edges_and_cumcounts!(nodes)
     end
 end
 
-@inline function _out_edges(nodes, node)
+@inline function _out_nodes(nodes, node)
     _prev_cumcnt = get(nodes._edge_cumcount, node - 1, 0)
     _cumcnt = nodes._edge_cumcount[node]
     return @view(nodes.edges.to_pos[_prev_cumcnt+1:_cumcnt])
 end
-@inline function _in_edges(nodes, node)
+@inline function _out_edges_and_nodes(nodes, node)
+    _prev_cumcnt = get(nodes._edge_cumcount, node - 1, 0)
+    _cumcnt = nodes._edge_cumcount[node]
+    return zip(UInt32(_prev_cumcnt+1):UInt32(_cumcnt), @view(nodes.edges.to_pos[_prev_cumcnt+1:_cumcnt]))
+end
+
+@inline function _in_nodes(nodes, node)
     _prev_cumcnt = get(nodes._back_cumcount, node - 1, 0)
     _cumcnt = nodes._back_cumcount[node]
     return @view(nodes.edges._from_pos[_prev_cumcnt+1:_cumcnt])
 end
+@inline function _in_edges_and_nodes(nodes, node)
+    _prev_cumcnt = get(nodes._back_cumcount, node - 1, 0)
+    _cumcnt = nodes._back_cumcount[node]
+    return zip(UInt32(_prev_cumcnt+1):UInt32(_cumcnt), @view(nodes.edges._from_pos[_prev_cumcnt+1:_cumcnt]))
+end
+
+_progress_print(x...) = (print("\e[H\e[2J"); println(x...))
+_progress_print() = print("\e[H\e[2J")
+function _progress_print_size(s, i, len)
+    slen = string(len); _progress_print(s, " ", lpad(string(i), length(slen)), " / ", slen)
+end
 
 function _parse_nodes_array!(nodes, file, pos, options)
+    Base.isinteractive() && _progress_print_size("Parsing nodes:", 0, length(nodes))
     for i in 1:length(nodes)
         res1 = Parsers.xparse(Int8, file, pos, length(file), options)
         node_type = res1.val
@@ -118,6 +137,7 @@ function _parse_nodes_array!(nodes, file, pos, options)
         @assert _res.val == 0 (_res, i, pos) # detachedness
         pos += _res.tlen
         pos = last(something(findnext(_parseable, file, pos), pos:pos))
+        Base.isinteractive() && iszero(i & 0x7ffff) && _progress_print_size("Parsing nodes:", i, length(nodes))
 
         nodes.type[i] = node_type
         nodes.name_index[i] = node_name_index
@@ -125,6 +145,7 @@ function _parse_nodes_array!(nodes, file, pos, options)
         nodes.self_size[i] = self_size
         nodes.edge_count[i] = edge_count
     end
+    Base.isinteractive() && _progress_print()
     return pos
 end
 
@@ -133,6 +154,7 @@ function _parse_edges_array!(nodes, file, pos, options)
     n_node_fields = 7
     node_idx = UInt32(1)
     edges = nodes.edges
+    Base.isinteractive() && _progress_print_size("Parsing edges:", 0, length(edges))
     for edge_count in nodes.edge_count
         for _ in 1:edge_count
             res1 = Parsers.xparse(Int8, file, pos, length(file), options)
@@ -155,37 +177,45 @@ function _parse_edges_array!(nodes, file, pos, options)
             edges.name_index[index] = edge_name_index
             edges.to_pos[index] = idx
             nodes._back_count[idx] += UInt32(1)
+            Base.isinteractive() && iszero(index & 0xfffff) && _progress_print_size("Parsing edges:", index, length(edges))
         end
         node_idx += UInt32(1)
     end
+    Base.isinteractive() && _progress_print()
 
     return pos
 end
 
 _parseable(b) = !(UInt8(b) in (UInt8(' '), UInt8('\n'), UInt8('\r'), UInt8(',')))
-function parse_nodes(path)
+function parse_nodes(file::Union{IOStream,AbstractString})
+    file = Mmap.mmap(file; grow=false, shared=false)
+    parse_nodes(file)
+end
+
+function parse_nodes(bytes::Vector{UInt8})
     OPTIONS = Parsers.Options(delim=',', stripwhitespace=true, ignoreemptylines=true)
 
-    file = Mmap.mmap(path; grow=false, shared=false)
-    pos = last(findfirst(b"edge_count\":", file)) + 1
-    res_e = Parsers.xparse(Int, file, pos, length(file), OPTIONS)
+    pos = last(findfirst(b"edge_count\":", bytes)) + 1
+    res_e = Parsers.xparse(Int, bytes, pos, length(bytes), OPTIONS)
     edge_count = res_e.val
-    pos = last(findfirst(b"node_count\":", file)) + 1
-    res_n = Parsers.xparse(Int, file, pos, length(file), OPTIONS)
+    pos = last(findfirst(b"node_count\":", bytes)) + 1
+    res_n = Parsers.xparse(Int, bytes, pos, length(bytes), OPTIONS)
     node_count = res_n.val
 
-    pos = last(findnext(b"nodes\":[", file, pos))+1
-    pos = last(something(findnext(_parseable, file, pos), pos:pos))
+    pos = last(findnext(b"nodes\":[", bytes, pos))+1
+    pos = last(something(findnext(_parseable, bytes, pos), pos:pos))
     nodes = Nodes(undef, node_count, edge_count)
-    pos = _parse_nodes_array!(nodes, file, pos, OPTIONS)
+    pos = _parse_nodes_array!(nodes, bytes, pos, OPTIONS)
 
-    pos = last(findnext(b"edges\":[", file, pos))+1
-    pos = last(something(findnext(_parseable, file, pos), pos:pos))
-    pos = _parse_edges_array!(nodes, file, pos, OPTIONS)
+    pos = last(findnext(b"edges\":[", bytes, pos))+1
+    pos = last(something(findnext(_parseable, bytes, pos), pos:pos))
+    pos = _parse_edges_array!(nodes, bytes, pos, OPTIONS)
 
-    pos = last(findnext(b"strings\":", file, pos)) + 1
-    pos = last(something(findnext(_parseable, file, pos), pos:pos))
-    strings = JSON3.read(view(file, pos:length(file)), Vector{String})
+    pos = last(findnext(b"strings\":", bytes, pos)) + 1
+    pos = last(something(findnext(_parseable, bytes, pos), pos:pos))
+    Base.isinteractive() && _progress_print("Parsing strings")
+    strings = JSON3.read(view(bytes, pos:length(bytes)), Vector{String})
+    Base.isinteractive() && _progress_print()
 
     return nodes, strings
 end
@@ -454,7 +484,7 @@ function subsample_snapshot(f, in_path, out_path=_default_outpath(in_path); trun
     @info "Reading snapshot from $(repr(in_path))"
     nodes, strings = parse_nodes(in_path)
 
-    print_sizes("BEFORE: ", nodes, strings, node_types)
+    print_sizes("BEFORE: ", nodes, strings, NODE_TYPES)
 
     filter_nodes!(f, nodes, strings)
 
@@ -468,8 +498,10 @@ function subsample_snapshot(f, in_path, out_path=_default_outpath(in_path); trun
 end
 
 const NODE_TYPES = ["synthetic","jl_task_t","jl_module_t","jl_array_t","object","String","jl_datatype_t","jl_svec_t","jl_sym_t"]
+const NODE_TYPES2 = ["synt","task","mod","arr","obj","str","type","svec","sym"]
 const NODE_FIELDS = ["type","name","id","self_size","edge_count","trace_node_id","detachedness"]
 const EDGE_TYPES = ["internal","hidden","element","property"]
+const EDGE_TYPES2 = ["intr","hide","elem","prop"]
 const EDGE_FIELDS = ["type","name_or_index","to_node"]
 
 include("ui.jl")

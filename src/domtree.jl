@@ -37,7 +37,7 @@ function get_preorder!(to_pre::Vector{UInt32}, to_parent_pre::Vector{UInt32}, fr
             to_pre[v] = t
             to_parent_pre[t] = parent_t
             from_pre[t] = v
-            for w in _out_edges(nodes, v)
+            for w in _out_nodes(nodes, v)
                 if iszero(to_pre[w])
                     push!(worklist, (w, t))
                 end
@@ -63,17 +63,20 @@ function get_domtree(nodes, scratch::Vector{UInt32})
     labels = collect(UInt32(1):UInt32(n))
     semi = fill(typemax(UInt32), n)
 
-    @time "get_preorder!" n_reachable = get_preorder!(to_pre, idoms_pre, from_pre, nodes, worklist)
+    Base.isinteractive() && _progress_print("Calculating preorder index")
+    n_reachable = get_preorder!(to_pre, idoms_pre, from_pre, nodes, worklist)
 
     for w in n_reachable+1:n
         labels[w] = semi[w]
+        idoms_pre[w] = UInt32(0)
     end
 
+    Base.isinteractive() && _progress_print("Constructing a dominator tree")
     ancestors .= idoms_pre
     for w in reverse(UInt32(2):UInt32(n_reachable))
         semi_w = typemax(UInt32)
         last_linked = w + true
-        for v in _in_edges(nodes, from_pre[w])
+        for v in _in_nodes(nodes, from_pre[w])
             v == 0 && continue
             v_pre = to_pre[v]
             # Ignore unreachable predecessors
