@@ -135,7 +135,11 @@ function HeapSnapshotMenu(snapshot::SnapshotTUIData)
     nodes = UInt32[1]
     edges = UInt32[0]
     depths = UInt8[0]
-    return HeapSnapshotMenu(snapshot, displaysize(IOContext(stdout, :limit=>true))[1], 0, 1, true, true, true, true, true, true, false, nodes, edges, depths)
+    pagesize = 1
+    pageoffset = 0
+    cursor = 1
+    listen = false
+    return HeapSnapshotMenu(snapshot, pagesize, pageoffset, cursor, true, true, true, true, true, true, listen, nodes, edges, depths)
 end
 function TerminalMenus.header(m::HeapSnapshotMenu)
     """
@@ -336,7 +340,7 @@ function browse(tdata::SnapshotTUIData)
     m = HeapSnapshotMenu(tdata)
     while m.should_continue
         m.should_continue = false
-        m.pagesize = displaysize(IOContext(stdout, :limit=>true))[1] - 2
+        m.pagesize = max(1, min(length(m.nodes), displaysize(IOContext(stdout, :limit=>true))[1] - 2))
         if m.listen # Apparently, we need to listen for user input outside of the menu loop
             try
                 Base.isinteractive() && _progress_print("regex for node names [\"\"]: ")
