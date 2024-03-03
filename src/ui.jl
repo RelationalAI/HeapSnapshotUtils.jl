@@ -125,6 +125,7 @@ mutable struct HeapSnapshotMenu <: TerminalMenus.AbstractMenu
     show_both_degrees::Bool
 
     should_continue::Bool
+    listen::Bool
 
     nodes::Vector{UInt32}
     edges::Vector{UInt32}
@@ -134,14 +135,22 @@ function HeapSnapshotMenu(snapshot::SnapshotTUIData)
     nodes = UInt32[1]
     edges = UInt32[0]
     depths = UInt8[0]
-    return HeapSnapshotMenu(snapshot, displaysize(IOContext(stdout, :limit=>true))[1], 0, 1, true, true, true, true, true, true, nodes, edges, depths)
+    return HeapSnapshotMenu(snapshot, displaysize(IOContext(stdout, :limit=>true))[1], 0, 1, true, true, true, true, true, true, false, nodes, edges, depths)
 end
-TerminalMenus.header(m::HeapSnapshotMenu) = "[r]eset, [p]arent [f]ocus, [l]arge retainers, [i]ds, [s]elf-size, [e]dges, [d]egrees, [v]erbose, [q]uit"
+function TerminalMenus.header(m::HeapSnapshotMenu)
+    """
+    [r]eset, [p]arent [f]ocus, [l]arge, [m]atch, [i]ds, [s]elf-size, [e]dges, [d]egrees, [v]erbose, [q]uit
+    Selected: $(length(m.nodes)) node$(length(m.nodes) == 1 ? "" : "s")
+    """
+end
 
 function _num_unfolded(m::HeapSnapshotMenu, cursor::Int)
     node = m.nodes[cursor]
     depth = m.depths[cursor]
     edge_count = m.direction ? m.snapshot.nodes.edge_count : m.snapshot.nodes._back_count
+    # We assume that if a node is unfolded, all of its children are in the list
+    # If we want to poke holes in the list, we need to keep track of the number of children
+    # by iterating through the list and counting the number of nodes with depth + 1 of the parent
     cnt = edge_count[node]
     unfolded = false
     if cnt > 0 && length(m.nodes) > cursor
@@ -191,44 +200,57 @@ function unfold!(m::HeapSnapshotMenu, cursor::Int)
     end
 end
 
-function reset_tree!(m::HeapSnapshotMenu)
+function reset_tree!(m::HeapSnapshotMenu, node::UInt32=UInt32(1), direction::Bool=true)
     empty!(m.nodes)
     empty!(m.edges)
     empty!(m.depths)
-    push!(m.nodes, 1)
-    push!(m.edges, 0)
-    push!(m.depths, 0)
+    if node > 0
+        push!(m.nodes, node)
+        push!(m.edges, 0)
+        push!(m.depths, 0)
+    end
+    m.direction = direction
     m.cursor = 1
     return true
 end
 
 function focus!(m::HeapSnapshotMenu, cursor::Int)
-    node = m.nodes[cursor]
-    reset_tree!(m)
-    m.nodes[1] = node
+    reset_tree!(m, m.nodes[cursor])
     unfold!(m, 1)
     return true
 end
 
 function reverse_tree!(m::HeapSnapshotMenu, cursor::Int)
-    node = m.nodes[cursor]
-    reset_tree!(m)
-    m.nodes[1] = node
-    m.direction = !m.direction
+    reset_tree!(m, m.nodes[cursor], !m.direction)
     unfold!(m, 1)
     return true
 end
 
 function largest_retainers!(m::HeapSnapshotMenu)
-    reset_tree!(m)
-    empty!(m.nodes)
-    empty!(m.edges)
-    empty!(m.depths)
+    reset_tree!(m, UInt32(0))
     for i in 1:min(length(m.snapshot.level1), max(100, m.pagesize))
         push!(m.nodes, m.snapshot.level1[i])
         push!(m.edges, 0)
         push!(m.depths, 0)
     end
+    return true
+end
+
+const DEFAULT_NODE_TYPE_BITSET = BitSet([0,1,2,3,4,6,7,8]) # i.e. no Strings
+function query!(m::HeapSnapshotMenu, pattern::Union{Regex,AbstractString}, minsize=0, node_type::BitSet = DEFAULT_NODE_TYPE_BITSET)
+    reset_tree!(m, UInt32(0))
+    # TODO: multithread?
+    for i in UInt32(1):UInt32(length(m.snapshot.nodes))
+        str = m.snapshot.strings[m.snapshot.nodes.name_index[i]+1]
+        retained = m.snapshot.retained_size[i]
+        typ = m.snapshot.nodes.type[i]
+        if occursin(pattern, str) && retained >= minsize && typ in node_type
+            push!(m.nodes, i)
+            push!(m.edges, 0)
+            push!(m.depths, 0)
+        end
+    end
+    !isempty(m.nodes) && sort!(m.nodes, by=x->m.snapshot.retained_size[x], rev=true)
     return true
 end
 
@@ -258,6 +280,10 @@ function TerminalMenus.keypress(m::HeapSnapshotMenu, i::UInt32)
     elseif c == 'e'
         m.show_edges = !m.show_edges
         return false
+    elseif c == 'm'
+        m.listen = true
+        m.should_continue = true
+        return true
     elseif c == 'v'
         if m.show_idxs && m.show_self_size && m.show_edges && m.show_both_degrees
             m.show_idxs = false
@@ -310,7 +336,26 @@ function browse(tdata::SnapshotTUIData)
     m = HeapSnapshotMenu(tdata)
     while m.should_continue
         m.should_continue = false
-        m.pagesize = displaysize(IOContext(stdout, :limit=>true))[1] - 1
+        m.pagesize = displaysize(IOContext(stdout, :limit=>true))[1] - 2
+        if m.listen # Apparently, we need to listen for user input outside of the menu loop
+            try
+                Base.isinteractive() && _progress_print("regex for node names [\"\"]: ")
+                pattern = Regex(readline())
+                default_size = pattern == r"" ? 32*1024*1024 : 0
+                print("minimal retained size in bytes [$default_size]: ")
+                minsize = let s = readline(); isempty(s) ? default_size : parse(Int, strip(s)) end
+                print("node types, 1 to $(length(NODE_TYPES)), comma separated [1,2,3,4,5,7,8,9]: ")
+                node_types = let s = readline();
+                    isempty(s) ? DEFAULT_NODE_TYPE_BITSET :
+                        BitSet(filter!(x->1 <= x <= 9, parse.(Int, strip.(split(s, ',')))) .- 1)
+                end
+                query!(m, pattern, minsize, node_types)
+            catch e
+                !(e isa InterruptException) && rethrow()
+            finally
+                m.listen = false
+            end
+        end
         Base.isinteractive() && _progress_print()
         request(m; cursor=m.cursor)
     end

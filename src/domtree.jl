@@ -71,7 +71,7 @@ function get_domtree(nodes, scratch::Vector{UInt32})
         idoms_pre[w] = UInt32(0)
     end
 
-    Base.isinteractive() && _progress_print("Constructing a dominator tree")
+    Base.isinteractive() && _progress_print("Constructing dominator tree")
     ancestors .= idoms_pre
     for w in reverse(UInt32(2):UInt32(n_reachable))
         semi_w = typemax(UInt32)

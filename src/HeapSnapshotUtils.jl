@@ -101,7 +101,7 @@ end
     return zip(UInt32(_prev_cumcnt+1):UInt32(_cumcnt), @view(nodes.edges._from_pos[_prev_cumcnt+1:_cumcnt]))
 end
 
-_progress_print(x...) = (print("\e[H\e[2J"); println(x...))
+_progress_print(x...) = (print("\e[H\e[2J"); print(x...))
 _progress_print() = print("\e[H\e[2J")
 function _progress_print_size(s, i, len)
     slen = string(len); _progress_print(s, " ", lpad(string(i), length(slen)), " / ", slen)
