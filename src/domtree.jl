@@ -23,6 +23,7 @@ function snca_compress_worklist!(
         end
         pop!(worklist)
     end
+    return nothing
 end
 
 function get_preorder!(to_pre::Vector{UInt32}, to_parent_pre::Vector{UInt32}, from_pre, nodes, worklist::Vector{Tuple{UInt32, UInt32}})

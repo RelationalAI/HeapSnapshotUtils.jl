@@ -2,7 +2,6 @@ module HeapSnapshotUtils
 
 using JSON3
 using Mmap
-using Parsers
 using CodecZlibNG
 using Profile
 
@@ -106,38 +105,74 @@ _progress_print() = print("\e[H\e[2J")
 function _progress_print_size(s, i, len)
     slen = string(len); _progress_print(s, " ", lpad(string(i), length(slen)), " / ", slen)
 end
+function _parse_int(::Type{T}, buf::Vector{UInt8}, pos::Int, stopat::UInt8) where T
+    out = zero(T)
+    @inbounds while true
+        c = buf[pos]
+        if c == stopat
+            break
+        else
+            out = T(10)*out + T(c & 0xf)
+        end
+        pos += 1
+    end
+    return out, pos
+end
 
-function _parse_nodes_array!(nodes, file, pos, options)
+@inline function _parse_int(::Type{T}, buf::Vector{UInt8}, pos::Int) where T
+    out = zero(T)
+    @inbounds while true
+        c = buf[pos]
+        if c in (UInt8(','),UInt8('\n'))
+            break
+        else
+            out = T(10)*out + T(c & 0xf)
+        end
+        pos += 1
+    end
+    return out, pos
+end
+
+@inline function _skip_to_int(buf::Vector{UInt8}, pos::Int)
+    @inbounds while true
+        c = buf[pos]
+        if c in (UInt8(','),UInt8('\n'))
+            pos += 1
+        else
+            break
+        end
+    end
+    return pos
+end
+
+function _parse_nodes_array!(nodes, file, pos)
     Base.isinteractive() && _progress_print_size("Parsing nodes:", 0, length(nodes))
     for i in 1:length(nodes)
-        res1 = Parsers.xparse(Int8, file, pos, length(file), options)
-        node_type = res1.val
-        pos += res1.tlen
+        pos = _skip_to_int(file, pos)
 
-        res2 = Parsers.xparse(UInt32, file, pos, length(file), options)
-        node_name_index = res2.val
-        pos += res2.tlen
+        node_type, pos = _parse_int(Int8, file, pos)
+        pos = _skip_to_int(file, pos)
 
-        res3 = Parsers.xparse(UInt, file, pos, length(file), options)
-        id = res3.val
-        pos += res3.tlen
+        node_name_index, pos = _parse_int(UInt32, file, pos)
+        pos = _skip_to_int(file, pos)
 
-        res4 = Parsers.xparse(Int, file, pos, length(file), options)
-        self_size = res4.val
-        pos += res4.tlen
+        id, pos = _parse_int(UInt, file, pos)
+        pos = _skip_to_int(file, pos)
 
-        res5 = Parsers.xparse(UInt, file, pos, length(file), options)
-        edge_count = res5.val
-        pos += res5.tlen
+        self_size, pos = _parse_int(Int, file, pos)
+        pos = _skip_to_int(file, pos)
 
-        _res = Parsers.xparse(Int8, file, pos, length(file), options)
-        @assert _res.val == 0 (_res, i, pos) # trace_node_id
-        pos += _res.tlen
-        _res = Parsers.xparse(Int8, file, pos, length(file), options)
-        @assert _res.val == 0 (_res, i, pos) # detachedness
-        pos += _res.tlen
-        pos = last(something(findnext(_parseable, file, pos), pos:pos))
-        Base.isinteractive() && iszero(i & 0x7ffff) && _progress_print_size("Parsing nodes:", i, length(nodes))
+        edge_count, pos = _parse_int(UInt32, file, pos)
+        pos = _skip_to_int(file, pos)
+
+        trace_node_id, pos = _parse_int(Int8, file, pos)
+        @assert trace_node_id == 0 (trace_node_id, i, pos) # unused
+        pos = _skip_to_int(file, pos)
+
+        detachedness, pos = _parse_int(Int8, file, pos)
+        @assert detachedness == 0 (detachedness, i, pos) # unused
+
+        Base.isinteractive() && iszero(i & 0xfffff) && _progress_print_size("Parsing nodes:", i, length(nodes))
 
         nodes.type[i] = node_type
         nodes.name_index[i] = node_name_index
@@ -149,7 +184,7 @@ function _parse_nodes_array!(nodes, file, pos, options)
     return pos
 end
 
-function _parse_edges_array!(nodes, file, pos, options)
+function _parse_edges_array!(nodes, file, pos)
     index = 0
     n_node_fields = 7
     node_idx = UInt32(1)
@@ -157,18 +192,15 @@ function _parse_edges_array!(nodes, file, pos, options)
     Base.isinteractive() && _progress_print_size("Parsing edges:", 0, length(edges))
     for edge_count in nodes.edge_count
         for _ in 1:edge_count
-            res1 = Parsers.xparse(Int8, file, pos, length(file), options)
-            edge_type = res1.val
-            pos += res1.tlen
+            pos = _skip_to_int(file, pos)
 
-            res2 = Parsers.xparse(UInt, file, pos, length(file), options)
-            edge_name_index = res2.val
-            pos += res2.tlen
+            edge_type, pos = _parse_int(Int8, file, pos)
+            pos = _skip_to_int(file, pos)
 
-            res3 = Parsers.xparse(UInt32, file, pos, length(file), options)
-            to_node = res3.val
-            pos += res3.tlen
-            pos = last(something(findnext(_parseable, file, pos), pos:pos))
+            edge_name_index, pos = _parse_int(UInt, file, pos)
+            pos = _skip_to_int(file, pos)
+
+            to_node, pos = _parse_int(UInt32, file, pos)
 
             idx = div(to_node, n_node_fields) + true # convert an index in the nodes array to a node number
 
@@ -193,23 +225,19 @@ function parse_nodes(file::Union{IOStream,AbstractString})
 end
 
 function parse_nodes(bytes::Vector{UInt8})
-    OPTIONS = Parsers.Options(delim=',', stripwhitespace=true, ignoreemptylines=true)
-
-    pos = last(findfirst(b"edge_count\":", bytes)) + 1
-    res_e = Parsers.xparse(Int, bytes, pos, length(bytes), OPTIONS)
-    edge_count = res_e.val
     pos = last(findfirst(b"node_count\":", bytes)) + 1
-    res_n = Parsers.xparse(Int, bytes, pos, length(bytes), OPTIONS)
-    node_count = res_n.val
+    node_count, pos = _parse_int(Int, bytes, pos, UInt8(','))
+    pos = last(findnext(b"edge_count\":", bytes, pos)) + 1
+    edge_count, pos = _parse_int(Int, bytes, pos, UInt8('}'))
 
-    pos = last(findnext(b"nodes\":[", bytes, pos))+1
+    pos = last(findnext(b"nodes\":[", bytes, pos)) + 1
     pos = last(something(findnext(_parseable, bytes, pos), pos:pos))
     nodes = Nodes(undef, node_count, edge_count)
-    pos = _parse_nodes_array!(nodes, bytes, pos, OPTIONS)
+    pos = _parse_nodes_array!(nodes, bytes, pos)
 
-    pos = last(findnext(b"edges\":[", bytes, pos))+1
+    pos = last(findnext(b"edges\":[", bytes, pos)) + 1
     pos = last(something(findnext(_parseable, bytes, pos), pos:pos))
-    pos = _parse_edges_array!(nodes, bytes, pos, OPTIONS)
+    pos = _parse_edges_array!(nodes, bytes, pos)
 
     pos = last(findnext(b"strings\":", bytes, pos)) + 1
     pos = last(something(findnext(_parseable, bytes, pos), pos:pos))
@@ -419,7 +447,7 @@ function write_snapshot(path, new_nodes, node_fields, strings)
             {"snapshot":{"meta":{"node_fields":["type","name","id","self_size","edge_count","trace_node_id","detachedness"],"node_types":[["synthetic","jl_task_t","jl_module_t","jl_array_t","object","String","jl_datatype_t","jl_sym_t","jl_svec_t"],"string", "number", "number", "number", "number", "number"],"edge_fields":["type","name_or_index","to_node"],"edge_types":[["internal","hidden","element","property"],"string_or_number","from_node"]},"""
         )
         println(io, "\"node_count\":$(length(new_nodes)),\"edge_count\":$(length(new_nodes.edges))},")
-        println(io, "\"nodes\":[")
+        print(io, "\"nodes\":[")
         for i in 1:length(new_nodes)
             i > 1 && println(io, ",")
             _write_decimal_number(io, new_nodes.type[i])
@@ -433,7 +461,7 @@ function write_snapshot(path, new_nodes, node_fields, strings)
             _write_decimal_number(io, new_nodes.edge_count[i])
             print(io, ",0,0")
         end
-        println(io, "],\"edges\":[")
+        print(io, "\n],\n\"edges\":[")
         for i in 1:length(new_nodes.edges)
             i > 1 && println(io, ",")
             _write_decimal_number(io, new_nodes.edges.type[i])
@@ -442,12 +470,12 @@ function write_snapshot(path, new_nodes, node_fields, strings)
             print(io, ",")
             _write_decimal_number(io, Int(new_nodes.edges.to_pos[i] - 1) * length(node_fields))
         end
-        println(io, "],\"strings\":[")
+        print(io, "\n],\n\"strings\":[")
         for (i, s) in enumerate(strings)
             i > 1 && println(io, ",")
             JSON3.write(io, s)
         end
-        println(io, "]}")
+        println(io, "\n]}")
     end
 end
 

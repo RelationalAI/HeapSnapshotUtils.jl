@@ -1,6 +1,6 @@
 using REPL.TerminalMenus
 
-function get_retained_size!(retained_size, idoms::Vector, scratch)
+function accum_sizes_topsort!(retained_size, idoms::Vector, scratch)
     n = length(idoms)
     level1 = UInt32[]
 
@@ -45,7 +45,7 @@ function SnapshotTUIData(nodes::Nodes, strings)
     domtree = get_domtree(nodes, scratch)
     retained_size = copy(nodes.self_size)
     Base.isinteractive() && _progress_print("Calculating retained size")
-    level1 = get_retained_size!(retained_size, domtree, scratch)
+    level1 = accum_sizes_topsort!(retained_size, domtree, scratch)
     Base.isinteractive() && _progress_print()
     return SnapshotTUIData(nodes, strings, domtree, retained_size, level1)
 end
@@ -363,4 +363,5 @@ function browse(tdata::SnapshotTUIData)
         Base.isinteractive() && _progress_print()
         request(m; cursor=m.cursor)
     end
+    _progress_print()
 end
