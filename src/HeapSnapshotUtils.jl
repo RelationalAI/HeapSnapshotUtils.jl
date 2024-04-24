@@ -123,7 +123,7 @@ end
     out = zero(T)
     @inbounds while true
         c = buf[pos]
-        if c in (UInt8(','),UInt8('\n'))
+        if c in (UInt8(','),UInt8('\n'),UInt8(']')) # closing bracket only needed for the last element
             break
         else
             out = T(10)*out + T(c & 0xf)
@@ -136,7 +136,7 @@ end
 @inline function _skip_to_int(buf::Vector{UInt8}, pos::Int)
     @inbounds while true
         c = buf[pos]
-        if c in (UInt8(','),UInt8('\n'))
+        if c in (UInt8(','),UInt8('\n'),UInt8(']')) # closing bracket only needed for the last element
             pos += 1
         else
             break
