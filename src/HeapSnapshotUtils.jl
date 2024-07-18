@@ -1,23 +1,24 @@
 module HeapSnapshotUtils
 
+using CodecZlibNG
 using JSON3
 using Mmap
-using CodecZlibNG
 using Profile
+using StringViews
 
 export subsample_snapshot, browse
 
 # SoA layout to help reduce field padding
 struct Edges
-    type::Vector{Int8}        # index into `snapshot.meta.edge_types`
-    name_index::Vector{UInt}  # index into `snapshot.strings`
-    to_pos::Vector{UInt32}    # index into `snapshot.nodes` (outgoing edge)
-    _from_pos::Vector{UInt32} # index into `snapshot.nodes` (inbound edge)
+    type::Vector{Int8}         # index into `snapshot.meta.edge_types`
+    name_index::Vector{UInt32} # index into `snapshot.strings`
+    to_pos::Vector{UInt32}     # index into `snapshot.nodes` (outgoing edge)
+    _from_pos::Vector{UInt32}  # index into `snapshot.nodes` (inbound edge)
 end
 function Edges(::UndefInitializer, n::Int)
     Edges(
         Vector{Int8}(undef, n),
-        Vector{UInt}(undef, n),
+        Vector{UInt32}(undef, n),
         Vector{UInt32}(undef, n),
         UInt32[],
     )
@@ -42,7 +43,7 @@ function Nodes(::UndefInitializer, n::Int, e::Int)
         Vector{UInt32}(undef, n),
         Vector{UInt}(undef, n),
         Vector{Int}(undef, n),
-        Vector{UInt32}(undef, n),
+        zeros(UInt32, n),
         zeros(UInt32, n),
         UInt32[],
         UInt32[],
@@ -105,11 +106,12 @@ _progress_print() = print("\e[H\e[2J")
 function _progress_print_size(s, i, len)
     slen = string(len); _progress_print(s, " ", lpad(string(i), length(slen)), " / ", slen)
 end
-function _parse_int(::Type{T}, buf::Vector{UInt8}, pos::Int, stopat::UInt8) where T
+
+@inline function _parse_int(::Type{T}, buf::Vector{UInt8}, pos::Int, stopat::Tuple) where T
     out = zero(T)
     @inbounds while true
         c = buf[pos]
-        if c == stopat
+        if c in stopat
             break
         else
             out = T(10)*out + T(c & 0xf)
@@ -206,7 +208,7 @@ function _parse_edges_array!(nodes, file, pos)
 
             index += 1
             edges.type[index] = edge_type
-            edges.name_index[index] = edge_name_index
+            edges.name_index[index] = unsafe_trunc(UInt32, edge_name_index) # For internal edges, the names index is typemax(UInt)
             edges.to_pos[index] = idx
             nodes._back_count[idx] += UInt32(1)
             Base.isinteractive() && iszero(index & 0xfffff) && _progress_print_size("Parsing edges:", index, length(edges))
@@ -226,9 +228,9 @@ end
 
 function parse_nodes(bytes::Vector{UInt8})
     pos = last(findfirst(b"node_count\":", bytes)) + 1
-    node_count, pos = _parse_int(Int, bytes, pos, UInt8(','))
+    node_count, pos = _parse_int(Int, bytes, pos, (UInt8(','),))
     pos = last(findnext(b"edge_count\":", bytes, pos)) + 1
-    edge_count, pos = _parse_int(Int, bytes, pos, UInt8('}'))
+    edge_count, pos = _parse_int(Int, bytes, pos, (UInt8('}'), UInt8(',')))
 
     pos = last(findnext(b"nodes\":[", bytes, pos)) + 1
     pos = last(something(findnext(_parseable, bytes, pos), pos:pos))
@@ -533,6 +535,7 @@ const EDGE_TYPES2 = ["intr","hide","elem","prop"]
 const EDGE_FIELDS = ["type","name_or_index","to_node"]
 
 include("ui.jl")
+include("assemble_snapshot.jl")
 include("domtree.jl")
 
 end # module HeapSnapshotUtils
