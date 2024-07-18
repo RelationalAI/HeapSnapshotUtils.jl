@@ -6,7 +6,7 @@ using Mmap
 using Profile
 using StringViews
 
-export subsample_snapshot, browse
+export subsample_snapshot, browse, assemble_snapshot
 
 # SoA layout to help reduce field padding
 struct Edges
