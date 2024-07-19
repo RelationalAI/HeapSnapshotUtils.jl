@@ -1,36 +1,41 @@
 module HeapSnapshotUtils
 
+using CodecZlibNG
 using JSON3
 using Mmap
-using Parsers
-using CodecZlibNG
+using Profile
+using StringViews
 
-export subsample_snapshot
+export subsample_snapshot, browse, assemble_snapshot
 
 # SoA layout to help reduce field padding
 struct Edges
-    type::Vector{Int8}       # index into `snapshot.meta.edge_types`
-    name_index::Vector{UInt} # index into `snapshot.strings`
-    to_pos::Vector{UInt32}   # index into `snapshot.nodes`
+    type::Vector{Int8}         # index into `snapshot.meta.edge_types`
+    name_index::Vector{UInt32} # index into `snapshot.strings`
+    to_pos::Vector{UInt32}     # index into `snapshot.nodes` (outgoing edge)
+    _from_pos::Vector{UInt32}  # index into `snapshot.nodes` (inbound edge)
 end
 function Edges(::UndefInitializer, n::Int)
     Edges(
         Vector{Int8}(undef, n),
-        Vector{UInt}(undef, n),
         Vector{UInt32}(undef, n),
+        Vector{UInt32}(undef, n),
+        UInt32[],
     )
 end
 Base.length(n::Edges) = length(n.type)
 
 # trace_node_id and detachedness are always 0 in the snapshots Julia produces so we don't store them
 struct Nodes
-    type::Vector{Int8}          # index in index into `snapshot.meta.node_types`
-    name_index::Vector{UInt32}  # index in `snapshot.strings`
-    id::Vector{UInt}            # unique id, in julia it is the address of the object
-    self_size::Vector{Int}      # size of the object itself, not including the size of its fields
-    edge_count::Vector{UInt32}  # number of outgoing edges
-    _back_count::Vector{UInt32} # number of inbound edges (not a part of the snapshot format, but useful for filtering nodes)
-    edges::Edges                # outgoing edges
+    type::Vector{Int8}             # index in index into `snapshot.meta.node_types`
+    name_index::Vector{UInt32}     # index in `snapshot.strings`
+    id::Vector{UInt}               # unique id, in julia it is the address of the object
+    self_size::Vector{Int}         # size of the object itself, not including the size of its fields
+    edge_count::Vector{UInt32}     # number of outgoing edges
+    _back_count::Vector{UInt32}    # number of inbound edges (not a part of the snapshot format, but useful for filtering nodes)
+    _edge_cumcount::Vector{UInt32} # cumulative count of outgoing edges
+    _back_cumcount::Vector{UInt32} # cumulative count of inbound edges
+    edges::Edges                   # vectors of edge attributes
 end
 function Nodes(::UndefInitializer, n::Int, e::Int)
     Nodes(
@@ -38,42 +43,138 @@ function Nodes(::UndefInitializer, n::Int, e::Int)
         Vector{UInt32}(undef, n),
         Vector{UInt}(undef, n),
         Vector{Int}(undef, n),
-        Vector{UInt32}(undef, n),
         zeros(UInt32, n),
+        zeros(UInt32, n),
+        UInt32[],
+        UInt32[],
         Edges(undef, e),
     )
 end
 Base.length(n::Nodes) = length(n.type)
+Base.@propagate_inbounds function Base.getindex(n::Nodes, i)
+    @boundscheck 1 <= i <= length(n)
+    return UInt32(i)
+end
 
-function _parse_nodes_array!(nodes, file, pos, options)
+function fill_back_edges_and_cumcounts!(nodes)
+    edge_cumcount = resize!(nodes._edge_cumcount, length(nodes))
+    cumsum!(edge_cumcount, nodes.edge_count)
+
+    from_pos = resize!(nodes.edges._from_pos, length(nodes.edges))
+
+    back_cumcount = resize!(nodes._back_cumcount, length(nodes))
+    cumsum!(back_cumcount, nodes._back_count)
+
+    fill!(nodes._back_count, 0)
+    index = 0
+    node_idx = UInt32(0)
+    for edge_count in nodes.edge_count
+        node_idx += UInt32(1)
+        for _ in 1:edge_count
+            index += 1
+            idx = nodes.edges.to_pos[index]
+            prev_cumcnt = get(back_cumcount, idx - 1, 0)
+            from_pos[prev_cumcnt + (nodes._back_count[idx] += UInt32(1))] = node_idx
+        end
+    end
+end
+
+@inline function _out_nodes(nodes, node)
+    _prev_cumcnt = get(nodes._edge_cumcount, node - 1, 0)
+    _cumcnt = nodes._edge_cumcount[node]
+    return @view(nodes.edges.to_pos[_prev_cumcnt+1:_cumcnt])
+end
+@inline function _out_edges_and_nodes(nodes, node)
+    _prev_cumcnt = get(nodes._edge_cumcount, node - 1, 0)
+    _cumcnt = nodes._edge_cumcount[node]
+    return zip(UInt32(_prev_cumcnt+1):UInt32(_cumcnt), @view(nodes.edges.to_pos[_prev_cumcnt+1:_cumcnt]))
+end
+
+@inline function _in_nodes(nodes, node)
+    _prev_cumcnt = get(nodes._back_cumcount, node - 1, 0)
+    _cumcnt = nodes._back_cumcount[node]
+    return @view(nodes.edges._from_pos[_prev_cumcnt+1:_cumcnt])
+end
+@inline function _in_edges_and_nodes(nodes, node)
+    _prev_cumcnt = get(nodes._back_cumcount, node - 1, 0)
+    _cumcnt = nodes._back_cumcount[node]
+    return zip(UInt32(_prev_cumcnt+1):UInt32(_cumcnt), @view(nodes.edges._from_pos[_prev_cumcnt+1:_cumcnt]))
+end
+
+_progress_print(x...) = (print("\e[H\e[2J"); print(x...))
+_progress_print() = print("\e[H\e[2J")
+function _progress_print_size(s, i, len)
+    slen = string(len); _progress_print(s, " ", lpad(string(i), length(slen)), " / ", slen)
+end
+
+@inline function _parse_int(::Type{T}, buf::Vector{UInt8}, pos::Int, stopat::Tuple) where T
+    out = zero(T)
+    @inbounds while true
+        c = buf[pos]
+        if c in stopat
+            break
+        else
+            out = T(10)*out + T(c & 0xf)
+        end
+        pos += 1
+    end
+    return out, pos
+end
+
+@inline function _parse_int(::Type{T}, buf::Vector{UInt8}, pos::Int) where T
+    out = zero(T)
+    @inbounds while true
+        c = buf[pos]
+        if c in (UInt8(','),UInt8('\n'),UInt8(']')) # closing bracket only needed for the last element
+            break
+        else
+            out = T(10)*out + T(c & 0xf)
+        end
+        pos += 1
+    end
+    return out, pos
+end
+
+@inline function _skip_to_int(buf::Vector{UInt8}, pos::Int)
+    @inbounds while true
+        c = buf[pos]
+        if c in (UInt8(','),UInt8('\n'),UInt8(']')) # closing bracket only needed for the last element
+            pos += 1
+        else
+            break
+        end
+    end
+    return pos
+end
+
+function _parse_nodes_array!(nodes, file, pos)
+    Base.isinteractive() && _progress_print_size("Parsing nodes:", 0, length(nodes))
     for i in 1:length(nodes)
-        res1 = Parsers.xparse(Int8, file, pos, length(file), options)
-        node_type = res1.val
-        pos += res1.tlen
+        pos = _skip_to_int(file, pos)
 
-        res2 = Parsers.xparse(UInt32, file, pos, length(file), options)
-        node_name_index = res2.val
-        pos += res2.tlen
+        node_type, pos = _parse_int(Int8, file, pos)
+        pos = _skip_to_int(file, pos)
 
-        res3 = Parsers.xparse(UInt, file, pos, length(file), options)
-        id = res3.val
-        pos += res3.tlen
+        node_name_index, pos = _parse_int(UInt32, file, pos)
+        pos = _skip_to_int(file, pos)
 
-        res4 = Parsers.xparse(Int, file, pos, length(file), options)
-        self_size = res4.val
-        pos += res4.tlen
+        id, pos = _parse_int(UInt, file, pos)
+        pos = _skip_to_int(file, pos)
 
-        res5 = Parsers.xparse(UInt, file, pos, length(file), options)
-        edge_count = res5.val
-        pos += res5.tlen
+        self_size, pos = _parse_int(Int, file, pos)
+        pos = _skip_to_int(file, pos)
 
-        _res = Parsers.xparse(Int8, file, pos, length(file), options)
-        @assert _res.val == 0 (_res, i, pos) # trace_node_id
-        pos += _res.tlen
-        _res = Parsers.xparse(Int8, file, pos, length(file), options)
-        @assert _res.val == 0 (_res, i, pos) # detachedness
-        pos += _res.tlen
-        pos = last(something(findnext(_parseable, file, pos), pos:pos))
+        edge_count, pos = _parse_int(UInt32, file, pos)
+        pos = _skip_to_int(file, pos)
+
+        trace_node_id, pos = _parse_int(Int8, file, pos)
+        @assert trace_node_id == 0 (trace_node_id, i, pos) # unused
+        pos = _skip_to_int(file, pos)
+
+        detachedness, pos = _parse_int(Int8, file, pos)
+        @assert detachedness == 0 (detachedness, i, pos) # unused
+
+        Base.isinteractive() && iszero(i & 0xfffff) && _progress_print_size("Parsing nodes:", i, length(nodes))
 
         nodes.type[i] = node_type
         nodes.name_index[i] = node_name_index
@@ -81,84 +182,70 @@ function _parse_nodes_array!(nodes, file, pos, options)
         nodes.self_size[i] = self_size
         nodes.edge_count[i] = edge_count
     end
+    Base.isinteractive() && _progress_print()
     return pos
 end
 
-function _parse_edges_array!(nodes, file, pos, options)
+function _parse_edges_array!(nodes, file, pos)
     index = 0
     n_node_fields = 7
     node_idx = UInt32(1)
     edges = nodes.edges
+    Base.isinteractive() && _progress_print_size("Parsing edges:", 0, length(edges))
     for edge_count in nodes.edge_count
         for _ in 1:edge_count
-            res1 = Parsers.xparse(Int8, file, pos, length(file), options)
-            edge_type = res1.val
-            pos += res1.tlen
+            pos = _skip_to_int(file, pos)
 
-            res2 = Parsers.xparse(UInt, file, pos, length(file), options)
-            edge_name_index = res2.val
-            pos += res2.tlen
+            edge_type, pos = _parse_int(Int8, file, pos)
+            pos = _skip_to_int(file, pos)
 
-            res3 = Parsers.xparse(UInt32, file, pos, length(file), options)
-            to_node = res3.val
-            pos += res3.tlen
-            pos = last(something(findnext(_parseable, file, pos), pos:pos))
+            edge_name_index, pos = _parse_int(UInt, file, pos)
+            pos = _skip_to_int(file, pos)
+
+            to_node, pos = _parse_int(UInt32, file, pos)
 
             idx = div(to_node, n_node_fields) + true # convert an index in the nodes array to a node number
 
             index += 1
             edges.type[index] = edge_type
-            edges.name_index[index] = edge_name_index
+            edges.name_index[index] = unsafe_trunc(UInt32, edge_name_index) # For internal edges, the names index is typemax(UInt)
             edges.to_pos[index] = idx
             nodes._back_count[idx] += UInt32(1)
+            Base.isinteractive() && iszero(index & 0xfffff) && _progress_print_size("Parsing edges:", index, length(edges))
         end
         node_idx += UInt32(1)
     end
+    Base.isinteractive() && _progress_print()
 
-    # NOTE: if we ever need to also find the `from_pos` edges, we can do the following:
-    # cumback = Vector{UInt32}(undef, length(nodes))
-    # cumback = cumsum!(cumback, nodes._back_count)
-    # fill!(nodes._back_count, 0)
-
-    # index = 0
-    # node_idx = UInt32(0)
-    # for edge_count in nodes.edge_count
-    #     node_idx += UInt32(1)
-    #     for _ in 1:edge_count
-    #         index += 1
-    #         idx = edges.to_pos[index]
-    #         prev_cumcnt = get(cumback, idx-1, 0)
-
-    #         edges.from_pos[prev_cumcnt + (nodes._back_count[idx] += UInt32(1))] = node_idx
-    #     end
-    # end
     return pos
 end
 
 _parseable(b) = !(UInt8(b) in (UInt8(' '), UInt8('\n'), UInt8('\r'), UInt8(',')))
-function parse_nodes(path)
-    OPTIONS = Parsers.Options(delim=',', stripwhitespace=true, ignoreemptylines=true)
+function parse_nodes(file::Union{IOStream,AbstractString})
+    file = Mmap.mmap(file; grow=false, shared=false)
+    parse_nodes(file)
+end
 
-    file = Mmap.mmap(path; grow=false, shared=false)
-    pos = last(findfirst(b"edge_count\":", file)) + 1
-    res_e = Parsers.xparse(Int, file, pos, length(file), OPTIONS)
-    edge_count = res_e.val
-    pos = last(findfirst(b"node_count\":", file)) + 1
-    res_n = Parsers.xparse(Int, file, pos, length(file), OPTIONS)
-    node_count = res_n.val
+function parse_nodes(bytes::Vector{UInt8})
+    pos = last(findfirst(b"node_count\":", bytes)) + 1
+    node_count, pos = _parse_int(Int, bytes, pos, (UInt8(','),))
+    pos = last(findnext(b"edge_count\":", bytes, pos)) + 1
+    edge_count, pos = _parse_int(Int, bytes, pos, (UInt8('}'), UInt8(',')))
 
-    pos = last(findnext(b"nodes\":[", file, pos))+1
-    pos = last(something(findnext(_parseable, file, pos), pos:pos))
+    pos = last(findnext(b"nodes\":[", bytes, pos)) + 1
+    pos = last(something(findnext(_parseable, bytes, pos), pos:pos))
     nodes = Nodes(undef, node_count, edge_count)
-    pos = _parse_nodes_array!(nodes, file, pos, OPTIONS)
+    pos = _parse_nodes_array!(nodes, bytes, pos)
 
-    pos = last(findnext(b"edges\":[", file, pos))+1
-    pos = last(something(findnext(_parseable, file, pos), pos:pos))
-    pos = _parse_edges_array!(nodes, file, pos, OPTIONS)
+    pos = last(findnext(b"edges\":[", bytes, pos)) + 1
+    pos = last(something(findnext(_parseable, bytes, pos), pos:pos))
+    pos = _parse_edges_array!(nodes, bytes, pos)
 
-    pos = last(findnext(b"strings\":", file, pos)) + 1
-    pos = last(something(findnext(_parseable, file, pos), pos:pos))
-    strings = JSON3.read(view(file, pos:length(file)), Vector{String})
+    pos = last(findnext(b"strings\":", bytes, pos)) + 1
+    pos = last(something(findnext(_parseable, bytes, pos), pos:pos))
+    Base.isinteractive() && _progress_print("Parsing strings")
+    strings = JSON3.read(view(bytes, pos:length(bytes)), Vector{String})
+    Base.isinteractive() && _progress_print()
 
     return nodes, strings
 end
@@ -362,7 +449,7 @@ function write_snapshot(path, new_nodes, node_fields, strings)
             {"snapshot":{"meta":{"node_fields":["type","name","id","self_size","edge_count","trace_node_id","detachedness"],"node_types":[["synthetic","jl_task_t","jl_module_t","jl_array_t","object","String","jl_datatype_t","jl_sym_t","jl_svec_t"],"string", "number", "number", "number", "number", "number"],"edge_fields":["type","name_or_index","to_node"],"edge_types":[["internal","hidden","element","property"],"string_or_number","from_node"]},"""
         )
         println(io, "\"node_count\":$(length(new_nodes)),\"edge_count\":$(length(new_nodes.edges))},")
-        println(io, "\"nodes\":[")
+        print(io, "\"nodes\":[")
         for i in 1:length(new_nodes)
             i > 1 && println(io, ",")
             _write_decimal_number(io, new_nodes.type[i])
@@ -376,7 +463,7 @@ function write_snapshot(path, new_nodes, node_fields, strings)
             _write_decimal_number(io, new_nodes.edge_count[i])
             print(io, ",0,0")
         end
-        println(io, "],\"edges\":[")
+        print(io, "\n],\n\"edges\":[")
         for i in 1:length(new_nodes.edges)
             i > 1 && println(io, ",")
             _write_decimal_number(io, new_nodes.edges.type[i])
@@ -385,12 +472,12 @@ function write_snapshot(path, new_nodes, node_fields, strings)
             print(io, ",")
             _write_decimal_number(io, Int(new_nodes.edges.to_pos[i] - 1) * length(node_fields))
         end
-        println(io, "],\"strings\":[")
+        print(io, "\n],\n\"strings\":[")
         for (i, s) in enumerate(strings)
             i > 1 && println(io, ",")
             JSON3.write(io, s)
         end
-        println(io, "]}")
+        println(io, "\n]}")
     end
 end
 
@@ -427,22 +514,28 @@ function subsample_snapshot(f, in_path, out_path=_default_outpath(in_path); trun
     @info "Reading snapshot from $(repr(in_path))"
     nodes, strings = parse_nodes(in_path)
 
-    node_types = ["synthetic","jl_task_t","jl_module_t","jl_array_t","object","String","jl_datatype_t","jl_svec_t","jl_sym_t"]
-    node_fields = ["type","name","id","self_size","edge_count","trace_node_id","detachedness"]
-    edge_types = ["internal","hidden","element","property"]
-    edge_fields = ["type","name_or_index","to_node"]
-
-    print_sizes("BEFORE: ", nodes, strings, node_types)
+    print_sizes("BEFORE: ", nodes, strings, NODE_TYPES)
 
     filter_nodes!(f, nodes, strings)
 
     new_strings = filter_strings(nodes, strings, trunc_strings_to)
 
-    print_sizes("AFTER:  ", nodes, new_strings, node_types)
+    print_sizes("AFTER:  ", nodes, new_strings, NODE_TYPES)
 
     @info "Writing snapshot to $(repr(out_path))"
-    write_snapshot(out_path, nodes, node_fields, new_strings)
+    write_snapshot(out_path, nodes, NODE_FIELDS, new_strings)
     return out_path
 end
+
+const NODE_TYPES = ["synthetic","jl_task_t","jl_module_t","jl_array_t","object","String","jl_datatype_t","jl_svec_t","jl_sym_t"]
+const NODE_TYPES2 = ["synt","task","mod","arr","obj","str","type","svec","sym"]
+const NODE_FIELDS = ["type","name","id","self_size","edge_count","trace_node_id","detachedness"]
+const EDGE_TYPES = ["internal","hidden","element","property"]
+const EDGE_TYPES2 = ["intr","hide","elem","prop"]
+const EDGE_FIELDS = ["type","name_or_index","to_node"]
+
+include("ui.jl")
+include("assemble_snapshot.jl")
+include("domtree.jl")
 
 end # module HeapSnapshotUtils
