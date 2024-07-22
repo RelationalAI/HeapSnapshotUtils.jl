@@ -27,6 +27,8 @@ Base.length(n::Edges) = length(n.type)
 
 # trace_node_id and detachedness are always 0 in the snapshots Julia produces so we don't store them
 struct Nodes
+    node_types::Vector{String}     # `snapshot.meta.node_types`[1] Julia was writing these in random order
+    edge_types::Vector{String}     # `snapshot.meta.edge_types`[1]
     type::Vector{Int8}             # index in index into `snapshot.meta.node_types`
     name_index::Vector{UInt32}     # index in `snapshot.strings`
     id::Vector{UInt}               # unique id, in julia it is the address of the object
@@ -37,8 +39,10 @@ struct Nodes
     _back_cumcount::Vector{UInt32} # cumulative count of inbound edges
     edges::Edges                   # vectors of edge attributes
 end
-function Nodes(::UndefInitializer, n::Int, e::Int)
+function Nodes(::UndefInitializer, node_types, edge_types, n::Int, e::Int)
     Nodes(
+        node_types,
+        edge_types,
         Vector{Int8}(undef, n),
         Vector{UInt32}(undef, n),
         Vector{UInt}(undef, n),
@@ -227,14 +231,22 @@ function parse_nodes(file::Union{IOStream,AbstractString})
 end
 
 function parse_nodes(bytes::Vector{UInt8})
-    pos = last(findfirst(b"node_count\":", bytes)) + 1
+    pos = last(findfirst(b"\"node_types\":[", bytes)) + 1
+    arrend = last(findnext(b"]", bytes, pos)) + 1
+    node_types = JSON3.read(view(bytes, pos:arrend), Vector{String})
+
+    pos = last(findnext(b"\"edge_types\":[", bytes, arrend)) + 1
+    arrend = last(findnext(b"]", bytes, pos)) + 1
+    edge_types = JSON3.read(view(bytes, pos:arrend), Vector{String})
+
+    pos = last(findnext(b"node_count\":", bytes, pos)) + 1
     node_count, pos = _parse_int(Int, bytes, pos, (UInt8(','),))
     pos = last(findnext(b"edge_count\":", bytes, pos)) + 1
     edge_count, pos = _parse_int(Int, bytes, pos, (UInt8('}'), UInt8(',')))
 
     pos = last(findnext(b"nodes\":[", bytes, pos)) + 1
     pos = last(something(findnext(_parseable, bytes, pos), pos:pos))
-    nodes = Nodes(undef, node_count, edge_count)
+    nodes = Nodes(undef, node_types, edge_types, node_count, edge_count)
     pos = _parse_nodes_array!(nodes, bytes, pos)
 
     pos = last(findnext(b"edges\":[", bytes, pos)) + 1
@@ -314,8 +326,10 @@ function filter_nodes!(f, nodes, strings)
 
     cumsum_edges = cumsum(nodes.edge_count)
     queue = sizehint!(UInt32[], length(nodes)) # we later reuse this array to re-map node indices
+    # Make the type consistent across snapshot
+    lut = indexin(["synthetic", "jl_task_t", "jl_module_t", "jl_array_t", "object","String","jl_datatype_t", "jl_svec_t", "jl_sym_t"], nodes.node_types)
     for node_idx in Iterators.rest(node_idxs, 1) # never attemp to filter out the root
-        node_type = nodes.type[node_idx]
+        node_type = @inbounds lut[nodes.type[node_idx]+true]-true
         self_size = nodes.self_size[node_idx]
         node_name = strings[nodes.name_index[node_idx]+1]
         f(node_type, self_size, node_name) && continue
@@ -404,11 +418,14 @@ function filter_strings(filtered_nodes, strings, trunc_strings_to)
         end
     end
     edges = filtered_nodes.edges
+    hide_type_index = Int8(findfirst(==("hidden"), filtered_nodes.edge_types)::Int - 1)
+    elem_type_index = Int8(findfirst(==("element"), filtered_nodes.edge_types)::Int - 1)
     for (e, type) in enumerate(edges.type)
         # Edges pointing to an object use the index field to point to the field
         # name in the parent struct. Type 2 are edges pointing to an element of
         # an array, so we don't need to update the name index.
-        type == 2 && continue
+        type == hide_type_index && continue
+        type == elem_type_index && continue
         edge_name_idx = edges.name_index[e]
         let s = strings[edge_name_idx+1]
             edges.name_index[e] = get!(strmap, _trunc_string(s, trunc_strings_to)) do
@@ -445,8 +462,9 @@ end
 
 function write_snapshot(path, new_nodes, node_fields, strings)
     open(path, "w") do io
+        # TODO: copy over other attributes from the original metadata
         println(io, """
-            {"snapshot":{"meta":{"node_fields":["type","name","id","self_size","edge_count","trace_node_id","detachedness"],"node_types":[["synthetic","jl_task_t","jl_module_t","jl_array_t","object","String","jl_datatype_t","jl_sym_t","jl_svec_t"],"string", "number", "number", "number", "number", "number"],"edge_fields":["type","name_or_index","to_node"],"edge_types":[["internal","hidden","element","property"],"string_or_number","from_node"]},"""
+            {"snapshot":{"meta":{"node_fields":["type","name","id","self_size","edge_count","trace_node_id","detachedness"],"node_types":[$(new_nodes.node_types),"string", "number", "number", "number", "number", "number"],"edge_fields":["type","name_or_index","to_node"],"edge_types":[$(new_nodes.edge_types),"string_or_number","from_node"]},"""
         )
         println(io, "\"node_count\":$(length(new_nodes)),\"edge_count\":$(length(new_nodes.edges))},")
         print(io, "\"nodes\":[")
@@ -514,24 +532,38 @@ function subsample_snapshot(f, in_path, out_path=_default_outpath(in_path); trun
     @info "Reading snapshot from $(repr(in_path))"
     nodes, strings = parse_nodes(in_path)
 
-    print_sizes("BEFORE: ", nodes, strings, NODE_TYPES)
+    print_sizes("BEFORE: ", nodes, strings, nodes.node_types)
 
     filter_nodes!(f, nodes, strings)
 
     new_strings = filter_strings(nodes, strings, trunc_strings_to)
 
-    print_sizes("AFTER:  ", nodes, new_strings, NODE_TYPES)
+    print_sizes("AFTER:  ", nodes, new_strings, nodes.node_types)
 
     @info "Writing snapshot to $(repr(out_path))"
     write_snapshot(out_path, nodes, NODE_FIELDS, new_strings)
     return out_path
 end
 
-const NODE_TYPES = ["synthetic","jl_task_t","jl_module_t","jl_array_t","object","String","jl_datatype_t","jl_svec_t","jl_sym_t"]
-const NODE_TYPES2 = ["synt","task","mod","arr","obj","str","type","svec","sym"]
+const NODE_TYPES = Dict([
+    "synthetic"    => "synt",
+    "jl_task_t"    => "task",
+    "jl_module_t"  => "mod",
+    "jl_array_t"   => "arr",
+    "object"       => "obj",
+    "String"       => "str",
+    "jl_datatype_t"=> "type",
+    "jl_svec_t"    => "svec",
+    "jl_sym_t"     => "sym",
+])
+const EDGE_TYPES = Dict([
+    "internal" => "intr",
+    "hidden"   => "hide",
+    "element"  => "elem",
+    "property" => "prop",
+])
+
 const NODE_FIELDS = ["type","name","id","self_size","edge_count","trace_node_id","detachedness"]
-const EDGE_TYPES = ["internal","hidden","element","property"]
-const EDGE_TYPES2 = ["intr","hide","elem","prop"]
 const EDGE_FIELDS = ["type","name_or_index","to_node"]
 
 include("ui.jl")

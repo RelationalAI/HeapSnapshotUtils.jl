@@ -15,6 +15,10 @@ using Test
 
             nodes_full, strings_full = HeapSnapshotUtils.parse_nodes(path_full)
             nodes_sample, strings_sample = HeapSnapshotUtils.parse_nodes(path_sample)
+            @test nodes_full.node_types == nodes_sample.node_types
+            @test nodes_full.edge_types == nodes_sample.edge_types
+            hide_type_index = Int8(findfirst(==("hidden"), nodes_full.edge_types)::Int - 1)
+            elem_type_index = Int8(findfirst(==("element"), nodes_full.edge_types)::Int - 1)
 
             @test length(nodes_full.type) == length(nodes_sample.type)
             @test length(nodes_full.name_index) == length(nodes_sample.name_index)
@@ -34,8 +38,9 @@ using Test
             @test nodes_full.self_size == nodes_sample.self_size
             @test nodes_full.edge_count == nodes_sample.edge_count
             @test nodes_full.edges.type == nodes_sample.edges.type
-            # edges.type .== 2 are indices into arrays which don't have a name
-            @test strings_full[nodes_full.edges.name_index[nodes_full.edges.type .!= 2] .+ 1] == strings_sample[nodes_sample.edges.name_index[nodes_full.edges.type .!= 2] .+ 1]
+
+            @test strings_full[nodes_full.edges.name_index[.!(in((hide_type_index, elem_type_index)).(nodes_full.edges.type))] .+ 1] ==
+                strings_sample[nodes_sample.edges.name_index[.!(in((hide_type_index, elem_type_index)).(nodes_full.edges.type))] .+ 1]
             @test nodes_full.edges.to_pos == nodes_sample.edges.to_pos
             @test sort(strings_full) == sort(strings_sample)
         finally
@@ -47,7 +52,7 @@ end
 
 @testset "50% filtering" begin
     mktemp() do path_full, io
-        Profile.Profile.take_heap_snapshot(io)
+        Profile.take_heap_snapshot(io)
         flush(io)
         close(io)
 
@@ -55,6 +60,8 @@ end
         try
             nodes_full, strings_full = HeapSnapshotUtils.parse_nodes(path_full)
             nodes_sample, strings_sample = HeapSnapshotUtils.parse_nodes(path_sample)
+            @test nodes_full.node_types == nodes_sample.node_types
+            @test nodes_full.edge_types == nodes_sample.edge_types
 
             # Test that the sample is less than 50% of the full snapshot
             @test length(nodes_sample.type) <= 0.55length(nodes_full.type)
@@ -76,6 +83,8 @@ end
             id_to_pos = Dict(id => pos for (pos, id) in enumerate(nodes_full.id) if !(id in filtered_out))
             cumsum_edges_full = cumsum(nodes_full.edge_count)
             cumsum_edges_sample = cumsum(nodes_sample.edge_count)
+            hide_type_index = Int8(findfirst(==("hidden"), nodes_full.edge_types)::Int - 1)
+            elem_type_index = Int8(findfirst(==("element"), nodes_full.edge_types)::Int - 1)
 
             for i in 1:length(nodes_sample)
                 id = nodes_sample.id[i]
@@ -90,7 +99,7 @@ end
 
                 edge_count_sample == 0 && continue
 
-                # Test thet after sampling, the nodes that we are connected through edges have the same properties
+                # Test that after sampling, the nodes that we are connected through edges have the same properties
                 sampled_edge_idx_range = cumsum_edges_sample[i] - edge_count_sample + 1:cumsum_edges_sample[i]
                 sampled_edge_node_ids = nodes_sample.id[nodes_sample.edges.to_pos[sampled_edge_idx_range]]
 
@@ -105,10 +114,12 @@ end
                 @test sampled_edge_node_ids == full_edge_node_ids
                 # Edge types are the same across the original and sampled snapshot
                 @test nodes_full.edges.type[full_edge_idxs] == nodes_sample.edges.type[sampled_edge_idx_range]
-                non_elements_samples = nodes_full.edges.type[full_edge_idxs] .!= 2
-                non_elements_full = nodes_sample.edges.type[sampled_edge_idx_range] .!= 2
+
+                non_elements_samples = .!(in((hide_type_index, elem_type_index)).(nodes_full.edges.type[full_edge_idxs]))
+                non_elements_full = .!(in((hide_type_index, elem_type_index)).(nodes_sample.edges.type[sampled_edge_idx_range]))
                 # Names of connected nodes are the same across the original and sampled snapshot
-                @test strings_full[nodes_full.edges.name_index[full_edge_idxs][non_elements_samples] .+ 1] == strings_sample[nodes_sample.edges.name_index[sampled_edge_idx_range][non_elements_full] .+ 1]
+                @test strings_full[nodes_full.edges.name_index[full_edge_idxs][non_elements_samples] .+ 1] ==
+                    strings_sample[nodes_sample.edges.name_index[sampled_edge_idx_range][non_elements_full] .+ 1]
             end
 
             @testset "No new orphan nodes are introduced" begin

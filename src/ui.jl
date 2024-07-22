@@ -35,6 +35,8 @@ struct SnapshotTUIData
     domtree::Vector{UInt32}
     retained_size::Vector{Int}
     level1::Vector{UInt32}
+    node_type_labels::Vector{String}
+    edge_type_labels::Vector{String}
 end
 
 function SnapshotTUIData(nodes::Nodes, strings)
@@ -47,7 +49,9 @@ function SnapshotTUIData(nodes::Nodes, strings)
     Base.isinteractive() && _progress_print("Calculating retained size")
     level1 = accum_sizes_topsort!(retained_size, domtree, scratch)
     Base.isinteractive() && _progress_print()
-    return SnapshotTUIData(nodes, strings, domtree, retained_size, level1)
+    node_type_labels = [NODE_TYPES[k] for k in nodes.node_types]
+    edge_type_labels = [EDGE_TYPES[k] for k in nodes.edge_types]
+    return SnapshotTUIData(nodes, strings, domtree, retained_size, level1, node_type_labels, edge_type_labels)
 end
 Base.length(n::SnapshotTUIData) = length(n.nodes)
 Base.@propagate_inbounds Base.getindex(n::SnapshotTUIData, i) = n.nodes[i]
@@ -65,17 +69,19 @@ _indent(io, n) = print(io, "    " ^ n)
 function _show_edge(io, nnodes, edge, accent, direction, show_edges)
     nodes = nnodes.nodes
     printstyled(io, direction ? "-→ " : "←- ", underline=accent)
-    show_edges || return
+    (!show_edges || !direction) && return # TODO: show both directions
     printstyled(io, "\"", underline=accent)
-    edge_index = nodes.edges.name_index[edge]+1
-    egde_type_idx = nodes.edges.type[edge]+1
-    edge_label = egde_type_idx == 3 ? string(edge_index-1) : # "element" type
-        egde_type_idx == 2 ? "<native>" : # "hidden" type
-        _short(get(nnodes.strings, edge_index, ""))
+
+    edge_name_index = nodes.edges.name_index[edge]+1
+    edge_type = nnodes.edge_type_labels[nodes.edges.type[edge]+1]
+    edge_label = edge_type == "elem" ? string(edge_name_index-1) :
+        edge_type == "hide" ? "<native>" :
+        _short(get(nnodes.strings, edge_name_index, ""))
     printstyled(io, edge_label, color=:blue, underline=accent)
+
     printstyled(io, "\"", underline=accent)
     printstyled(io, "/", underline=accent)
-    printstyled(io, EDGE_TYPES2[egde_type_idx], color=:magenta, underline=accent)
+    printstyled(io, edge_type, color=:magenta, underline=accent)
     printstyled(io, direction ? " → " : " ← ", underline=accent)
 end
 function _show_node(io, nnodes, node, accent, direction, show_idxs, show_self_size, show_both_degrees)
@@ -83,7 +89,7 @@ function _show_node(io, nnodes, node, accent, direction, show_idxs, show_self_si
     printstyled(io, "\"", underline=accent)
     printstyled(io, _short(nnodes.strings[nodes.name_index[node]+1]), bold=true, color=:blue, underline=accent)
     printstyled(io, "\"/", underline=accent)
-    printstyled(io, NODE_TYPES2[nodes.type[node]+1], color=:magenta, underline=accent)
+    printstyled(io, nnodes.node_type_labels[nodes.type[node]+1], color=:magenta, underline=accent)
     if show_idxs
         printstyled(io, " @ ", underline=accent)
         printstyled(io, string(node), color=:light_cyan, underline=accent)
@@ -348,9 +354,11 @@ function browse(tdata::SnapshotTUIData)
                 default_size = pattern == r"" ? 32*1024*1024 : 0
                 print("minimal retained size in bytes [$default_size]: ")
                 minsize = let s = readline(); isempty(s) ? default_size : parse(Int, strip(s)) end
-                print("node types, 1 to $(length(NODE_TYPES)), comma separated [1,2,3,4,5,7,8,9]: ")
+                # No strings by default
+                indices = Int.(indexin(["synthetic", "jl_task_t", "jl_module_t", "jl_array_t", "object", "jl_datatype_t", "jl_svec_t", "jl_sym_t"], tdata.nodes.node_types))
+                print("Select node types by index $(tdata.nodes.node_types), default $indices")
                 node_types = let s = readline();
-                    isempty(s) ? DEFAULT_NODE_TYPE_BITSET :
+                    isempty(s) ? BitSet(indices .- 1) :
                         BitSet(filter!(x->1 <= x <= 9, parse.(Int, strip.(split(s, ',')))) .- 1)
                 end
                 query!(m, pattern, minsize, node_types)

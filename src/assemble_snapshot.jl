@@ -25,6 +25,7 @@ function _read_streamed_edges(path, nodes)
     @inbounds try
         for i in 1:length(nodes.edges)
             edge_type = read(io, Int8)
+            # some name indices are typemax(UInt64), but for no good reason AFAICT, so we just truncate
             edge_name_index = Base.unsafe_trunc(UInt32, read(io, UInt))
             from_node = read(io, UInt)
             to_node = read(io, UInt)
@@ -61,7 +62,7 @@ function _get_permuation_vec(nodes)
     return perms
 end
 
-
+# Only materializes the StringView "key" if it's not already in the dictionary
 function _get!(default::Base.Callable, h::Dict{K,V}, key) where {K,V}
     index, sh = Base.ht_keyindex2_shorthash!(h, key)
 
@@ -91,6 +92,10 @@ function _read_streamed_strings(path, nodes, nodes_task, edges_task)
     buf = Vector{UInt8}(undef, 4096)
     strmap = sizehint!(Dict{String, UInt32}(), length(nodes) >> 1)
     strings = sizehint!(String[], length(nodes))
+    # These don't have a corresponding name in strings
+    elem_type_index = Int8(findfirst(==("element"), nodes.edge_types)::Int - 1)
+    hide_type_index = Int8(findfirst(==("hidden"), nodes.edge_types)::Int - 1)
+
     @inbounds try
         while !eof(io)
             str_size = read(io, UInt)
@@ -117,7 +122,7 @@ function _read_streamed_strings(path, nodes, nodes_task, edges_task)
 
         wait(edges_task)
         for i in 1:length(nodes.edges)
-            (nodes.edges.type[i] in (Int8(1), Int8(2))) && continue
+            (nodes.edges.type[i] in (elem_type_index, hide_type_index)) && continue
             str = strings[nodes.edges.name_index[i]+true]
             nodes.edges.name_index[i] = strmap[str]
         end
@@ -135,13 +140,57 @@ function _read_streamed_strings(path, nodes, nodes_task, edges_task)
     end
 end
 
-function _write_snapshot_permute(path, nodes, node_fields, strings, perms)
+function _maybe_write!(io, d, k, isfirst=false)
+    if haskey(d, k)
+        _pop_write!(io, d, k, isfirst)
+        return true
+    end
+    return false
+end
+function _pop_write!(io, d, k, isfirst=false)
+    isfirst || print(io, ",")
+    print(io, "\"$k\":")
+    JSON3.write(io, pop!(d, k))
+end
+
+function _write_snapshot_permute(path, metadata, nodes, node_fields, strings, perms)
+    snapshot = pop!(metadata, :snapshot)
+    meta = pop!(snapshot, :meta)
     open(path, "w") do io
-        println(io, """
-            {"snapshot":{"meta":{"node_fields":["type","name","id","self_size","edge_count","trace_node_id","detachedness"],"node_types":[["synthetic","jl_task_t","jl_module_t","jl_array_t","object","String","jl_datatype_t","jl_sym_t","jl_svec_t"],"string", "number", "number", "number", "number", "number"],"edge_fields":["type","name_or_index","to_node"],"edge_types":[["internal","hidden","element","property"],"string_or_number","from_node"]},"""
-        )
-        println(io, "\"node_count\":$(length(nodes)),\"edge_count\":$(length(nodes.edges))},")
-        print(io, "\"nodes\":[")
+        print(io, "{\"snapshot\":{")
+            # Trying to write the metadata in the same order as the original
+            # the VSCode heap snapshot is very picky about the order of and format of the metadata
+            print(io, "\"meta\":{")
+                _pop_write!(io, meta, :node_fields, true)
+                _pop_write!(io, meta, :node_types)
+                _pop_write!(io, meta, :edge_fields)
+                _pop_write!(io, meta, :edge_types)
+                _maybe_write!(io, meta, :trace_function_info_fields)
+                _maybe_write!(io, meta, :trace_node_fields)
+                _maybe_write!(io, meta, :sample_fields)
+                _maybe_write!(io, meta, :location_fields)
+                for k in keys(meta)
+                    _pop_write!(io, meta, k)
+                end
+            println(io, "},")
+            _pop_write!(io, snapshot, :node_count, true)
+            _pop_write!(io, snapshot, :edge_count)
+            _maybe_write!(io, meta, :trace_function_count)
+            for k in keys(snapshot)
+                _pop_write!(io, snapshot, k)
+            end
+            println(io, "},")
+        _written_meta  = _maybe_write!(io, metadata, :trace_function_infos, true)
+        _written_meta |= _maybe_write!(io, metadata, :trace_tree,           !_written_meta)
+        _written_meta |= _maybe_write!(io, metadata, :samples,              !_written_meta)
+        _written_meta |= _maybe_write!(io, metadata, :locations,            !_written_meta)
+        for k in keys(metadata)
+            _pop_write!(io, meta, k, _written_meta)
+            _written_meta = true
+        end
+        _written_meta && println(io, ",")
+
+        println(io, "\"nodes\":[")
         @inbounds for i in 1:length(nodes)
             i > 1 && println(io, ",")
             _write_decimal_number(io, nodes.type[i])
@@ -155,7 +204,8 @@ function _write_snapshot_permute(path, nodes, node_fields, strings, perms)
             _write_decimal_number(io, nodes.edge_count[i])
             print(io, ",0,0")
         end
-        print(io, "\n],\n\"edges\":[")
+
+        print(io, "],\"edges\":[\n")
         _written_init = false
         @inbounds for i in perms
             _written_init && println(io, ",")
@@ -166,7 +216,8 @@ function _write_snapshot_permute(path, nodes, node_fields, strings, perms)
             _write_decimal_number(io, Int(nodes.edges.to_pos[i]) * length(node_fields))
             _written_init = true
         end
-        print(io, "\n],\n\"strings\":[")
+
+        print(io, "],\n\"strings\":[\n")
         for (i, s) in enumerate(strings)
             i > 1 && println(io, ",")
             JSON3.write(io, s)
@@ -175,10 +226,16 @@ function _write_snapshot_permute(path, nodes, node_fields, strings, perms)
     end
 end
 
-function assemble_snapshot(in_prefix, out_file=string(in_prefix, ".heapsnapshot"))
-    meta = JSON3.read("$in_prefix.metadata.json")
+function assemble_snapshot(in_prefix, out_file=endswith(in_prefix, ".heapsnapshot") ? in_prefix : string(in_prefix, ".heapsnapshot"))
+    meta = copy(JSON3.read("$in_prefix.metadata.json"))
 
-    nodes = Nodes(undef, meta[:snapshot][:node_count], meta[:snapshot][:edge_count])
+    nodes = Nodes(
+        undef,
+        meta[:snapshot][:meta][:node_types][1],
+        meta[:snapshot][:meta][:edge_types][1],
+        meta[:snapshot][:node_count],
+        meta[:snapshot][:edge_count]
+    )
 
     nodes_task = Threads.@spawn _read_streamed_nodes("$in_prefix.nodes", $nodes)
     edges_task = Threads.@spawn _read_streamed_edges("$in_prefix.edges", $nodes)
@@ -186,6 +243,6 @@ function assemble_snapshot(in_prefix, out_file=string(in_prefix, ".heapsnapshot"
     strings = _read_streamed_strings("$in_prefix.strings", nodes, nodes_task, edges_task)
     perms = _get_permuation_vec(nodes)
 
-    _write_snapshot_permute(out_file, nodes, NODE_FIELDS, strings, perms)
+    _write_snapshot_permute(out_file, meta, nodes, NODE_FIELDS, strings, perms)
     return out_file
 end
